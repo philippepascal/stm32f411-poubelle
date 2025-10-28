@@ -1,0 +1,9 @@
+[target.thumbv7em-none-eabihf]
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+  "-C", "panic=abort",
+]
+
+[build]
+#target = "thumbv7em-none-eabi"
+target = "thumbv7em-none-eabihf"

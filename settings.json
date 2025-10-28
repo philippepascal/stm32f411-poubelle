@@ -1,0 +1,15 @@
+{
+    // Tell rust-analyzer to use the same target you're building for
+    "rust-analyzer.cargo.target": "thumbv7em-none-eabihf",
+
+    // Make sure build scripts (like your build.rs) are run so linker args, cfgs, etc. are visible
+    "rust-analyzer.cargo.buildScripts.enable": true,
+
+    // Also let it check with the right features / panic profile
+    "rust-analyzer.check.allTargets": false,
+
+    // Use `cargo check --release` style (smaller code differences vs dev). Optional:
+    "rust-analyzer.check.extraArgs": [
+        "--release"
+    ]
+}
