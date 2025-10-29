@@ -13,7 +13,14 @@ mkdir -p target/thumbv7em-none-eabihf/flash
 arm-none-eabi-objcopy -O binary \
   target/thumbv7em-none-eabihf/release/stm32f411-poubelle \
   target/thumbv7em-none-eabihf/flash/firmware.bin
+# arm-none-eabi-objcopy -O ihex \
+#   target/thumbv7em-none-eabihf/release/stm32f411-poubelle \
+#   target/thumbv7em-none-eabihf/flash/firmware.hex
 
+# dfu-util --device "$dev" \
+#   -a 0 \
+#   -s 0x08000000:leave \
+#   -D target/thumbv7em-none-eabihf/flash/firmware.hex
 dfu-util --device "$dev" \
   -a 0 \
   -s 0x08000000:leave \

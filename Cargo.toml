@@ -3,18 +3,18 @@ name = "stm32f411-poubelle"
 version = "0.1.0"
 edition = "2024"
 
+
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 alloc-cortex-m = "0.4"
-
 # Peripheral Access Crate (auto-generated low-level regs for F411)
 stm32f4 = { version = "0.15", features = ["stm32f411", "rt"] }
-
 # High-level Hardware Abstraction Layer for stm32f4xx
-stm32f4xx-hal = { version = "0.22", features = ["stm32f411"] }
-
+stm32f4xx-hal = { version = "0.22.0", features = ["stm32f411", "usb_fs"] }
 panic-halt = "0.2"
+usb-device = "0.3"
+usbd-serial = "0.2.2"
 
 [profile.release]
 panic = "abort"
