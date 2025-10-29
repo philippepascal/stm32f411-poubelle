@@ -5,8 +5,12 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc_cortex_m::CortexMHeap;
 
+use cortex_m::{asm, delay};
 use cortex_m_rt::entry;
 use panic_halt as _;
+use cortex_m::peripheral::syst::SystClkSource;
+use cortex_m::peripheral::SYST;
+use cortex_m_rt::exception;
 
 use hal::gpio::alt::otg_fs::{Dm, Dp};
 use hal::{otg_fs, pac, prelude::*};
@@ -28,7 +32,7 @@ pub fn usb_log(tick: u32, text: &str) {
         // if tick.wrapping_sub(LAST_LOG_TICK) < LOG_PERIOD_TICKS {
         //     return;
         // }
-        LAST_LOG_TICK = tick;
+        // LAST_LOG_TICK = tick;
 
         // Build timestamped message
         let msg = alloc::format!("[{:08}] {}\r\n", tick, text);
@@ -82,11 +86,19 @@ use crate::mem::*;
 #[global_allocator]
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 
+static mut gt: u32 = 0;
+#[exception]
+fn SysTick() {
+    // Called every 5ms (configured in main)
+    unsafe {gt = gt.wrapping_add(1)};
+    usb_poll_once();
+}
+
 #[entry]
 fn main() -> ! {
     // Take ownership of the peripherals
-    let cp = cortex_m::Peripherals::take().unwrap();
-    let mut dp = pac::Peripherals::take().unwrap();
+    let mut cp = cortex_m::Peripherals::take().unwrap();
+    let dp = pac::Peripherals::take().unwrap();
 
     // Set up clocks
     let rcc = dp.RCC.constrain();
@@ -96,6 +108,21 @@ fn main() -> ! {
         .sysclk(100.MHz())
         .require_pll48clk()
         .freeze();
+
+    // -------------------------------------------------
+    // Configure SysTick to fire every 5ms
+    //
+    // SysTick runs from core clock (set to 100 MHz above).
+    // 5ms period => 0.005s * 100_000_000 ticks/sec = 500_000 ticks.
+    // Reload register is (ticks - 1).
+    //
+    let syst: &mut SYST = &mut cp.SYST;
+    syst.set_clock_source(SystClkSource::Core);
+    syst.set_reload(500_000 - 1);
+    syst.clear_current();
+    syst.enable_interrupt();
+    syst.enable_counter();
+    // -------------------------------------------------
 
     // Enable GPIOC (for the LED on PC13 on many BlackPill-style boards)
     let gpioc = dp.GPIOC.split();
@@ -180,26 +207,36 @@ fn main() -> ! {
     let mut led = gpioc.pc13.into_push_pull_output();
     let mut tick: u32 = 0;
 
+    //prime things up??
+    for i in 0..20 {
+        usb_poll_once();
+        asm::delay(500_000);
+    }
+
+
     // Simple blink loop
     loop {
         tick = tick.wrapping_add(1);
 
-        // keep USB stack alive no matter what
-        usb_poll_once();
+        // usb_poll_once();
 
         // blink LED
-        if tick % 100_000 == 0 {
+        if tick % 500_000 == 0 {
             led.set_high();
         }
-        if tick % 200_000 == 0 {
+        if tick % 1_000_000 == 0 {
             led.set_low();
         }
 
         // throttle logging
-        if tick % 10_000 == 0 {
-            usb_log(tick, "main loop alive");
+        if tick % 1_000_000 == 0 {
+             usb_log(tick, "main loop alive");
+             unsafe {usb_log(gt, "interrupt driven polls")};
         }
 
-        // eventually: state = state.run();
+        if tick > 100_000_000 {
+            state = state.run();
+        }
+        // state = state.run();
     }
 }

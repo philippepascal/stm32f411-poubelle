@@ -5,6 +5,7 @@
 
 use alloc::boxed::Box;
 use cortex_m::asm;
+use crate::usb_log;
 
 pub fn init_state(max_open: u16) -> Box<dyn State> {
     Box::new(ClosedState{keep_running: true, position: Position{max_open, current: 0}})
@@ -39,12 +40,14 @@ struct OpenState {
 }
 impl State for OpenState {
     fn run(self: Box<Self>) -> Box<dyn State> {
+        usb_log(0, "starting Open State run()");
         let mut elapsed_ms = 0;
         while self.keep_running && elapsed_ms < 5000 {
             // roughly 1ms delay at 100 MHz
             asm::delay(100_000);
             elapsed_ms += 1;
         }
+        usb_log(0, "stoping Open State run()");
         Box::new(ClosingState{position: self.position})
     }
 }
@@ -54,6 +57,7 @@ struct ClosingState {
 }
 impl State for ClosingState {
     fn run(self: Box<Self>) -> Box<dyn State> {
+        usb_log(0, "starting Closing State run()");
         Box::new(ClosedState{keep_running: true, position: self.position})
     }
 }
@@ -63,6 +67,14 @@ struct ClosedState {
 }
 impl State for ClosedState {
     fn run(self: Box<Self>) -> Box<dyn State> {
+        usb_log(0, "starting Closed State run()");
+        let mut elapsed_ms = 0;
+        while self.keep_running && elapsed_ms < 5000 {
+            // roughly 1ms delay at 100 MHz
+            asm::delay(100_000);
+            elapsed_ms += 1;
+        }
+        usb_log(0, "closing Closed State run()");
         Box::new(OpeningState{position: self.position})
     }
 }
@@ -72,6 +84,16 @@ struct OpeningState {
 }
 impl State for OpeningState {
     fn run(self: Box<Self>) -> Box<dyn State> {
+        usb_log(0, "starting Opening State run()");
+        let mut step_count = self.position.current;
+        let mut elapsed_ms = 0;
+        while step_count > 0 && elapsed_ms < 5000 {
+            step_count -= 1;
+            // roughly 1ms delay at 100 MHz
+            asm::delay(100_000);
+            elapsed_ms += 1;
+        }
+        usb_log(0, "closing Opening State run()");
         Box::new(OpenState{keep_running: true, position: self.position})
     }
 }
