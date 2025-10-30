@@ -1,263 +1,172 @@
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-use alloc::boxed::Box;
-use alloc_cortex_m::CortexMHeap;
-
 use cortex_m::asm;
-use cortex_m_rt::entry;
-use panic_halt as _;
-use cortex_m::peripheral::syst::SystClkSource;
-use cortex_m::peripheral::SYST;
-use cortex_m_rt::exception;
-
-use hal::gpio::alt::otg_fs::{Dm, Dp};
-use hal::{otg_fs, pac, prelude::*};
-use stm32f4xx_hal::gpio::PinState;
 use stm32f4xx_hal as hal;
-
+use hal::{
+    gpio::{Output, PushPull, gpioa::PA0, gpioa::PA1, gpioc::PC13},
+    otg_fs,
+    pac,
+    prelude::*,
+};
+use rtic::app;
+use panic_halt as _;
+use usb_device::{prelude::*, class_prelude::UsbBusAllocator};
+use usbd_serial::SerialPort;
 use stm32f4xx_hal::otg_fs::UsbBus as HalUsbBus;
-use usb_device::{class_prelude::UsbBusAllocator, prelude::*};
-use usbd_serial::{SerialPort, USB_CLASS_CDC};
-use core::mem::MaybeUninit;
-use usb_device::device::UsbDevice; // helper to block on nb::Result
 
-/// Queue a USB log message if enough time has passed.
-/// Safe wrapper that can be called from main loop and (later) other modules.
-/// `tick` is the current timestamp/counter.
-/// `text` is the log body (no newline needed).
-pub fn usb_log(tick: u32, text: &str) {
-    unsafe {
-        // Simple rate limiter: only log if (tick - LAST_LOG_TICK) >= LOG_PERIOD_TICKS
-        // if tick.wrapping_sub(LAST_LOG_TICK) < LOG_PERIOD_TICKS {
-        //     return;
-        // }
-        // LAST_LOG_TICK = tick;
+// --- Type aliases for USB stack
+type HalUsb = HalUsbBus<otg_fs::USB>;
+type UsbDev<'a> = usb_device::device::UsbDevice<'a,HalUsb>;
+type Serial<'a> = usbd_serial::SerialPort<'a,HalUsb>;
 
-        // Build timestamped message
-        let msg = alloc::format!("[{:08}] {}\r\n", tick, text);
+#[app(device = stm32f4xx_hal::pac, peripherals = true)]
+mod app {
+    use super::*;
 
-        // Get the global USB device + serial
-        #[allow(static_mut_refs)]
-        let dev_ref: &mut UsbDevice<HalUsbBusType> = USB_DEV.assume_init_mut();
-        #[allow(static_mut_refs)]
-        let serial_ref: &mut SerialPort<HalUsbBusType> = USB_SERIAL.assume_init_mut();
-
-        // Poll USB so host traffic stays serviced
-        let mut classes: [&mut dyn usb_device::class_prelude::UsbClass<HalUsbBusType>; 1] =
-            [serial_ref];
-    
-        let _ = dev_ref.poll(&mut classes);
-
-        // Then attempt to write no matter what
-        let _ = serial_ref.write(msg.as_bytes());
-
+    // Resources shared across tasks (RTIC locks these automatically)
+    #[shared]
+    struct Shared {
+        usb_dev: UsbDev<'static>,
+        serial: SerialPort<'static,HalUsb>,
+        dir_pin: PA0<Output<PushPull>>,
+        step_pin: PA1<Output<PushPull>>,
+        led_pin: PC13<Output<PushPull>>,
     }
-}
-pub fn usb_poll_once() {
-    unsafe {
-        #[allow(static_mut_refs)]
-        let dev_ref: &mut UsbDevice<HalUsbBusType> = USB_DEV.assume_init_mut();
-        #[allow(static_mut_refs)]
-        let serial_ref: &mut SerialPort<HalUsbBusType> = USB_SERIAL.assume_init_mut();
 
-        let mut classes: [&mut dyn usb_device::class_prelude::UsbClass<HalUsbBusType>; 1] =
-            [serial_ref];
-        let _ = dev_ref.poll(&mut classes);
+    // Resources local to specific tasks (not shared)
+    #[local]
+    struct Local {
+        // e.g., LED pin, counters, etc.
     }
-}
 
-type HalUsbBusType = HalUsbBus<otg_fs::USB>;
-// We'll treat this as the "bus allocator" the stack expects.
-static mut USB_ALLOC: MaybeUninit<UsbBusAllocator<HalUsbBusType>> = MaybeUninit::uninit();
-// CDC-ACM class and UsbDevice
-static mut USB_SERIAL: MaybeUninit<SerialPort<HalUsbBusType>> = MaybeUninit::uninit();
-static mut USB_DEV: MaybeUninit<UsbDevice<HalUsbBusType>> = MaybeUninit::uninit();
+    #[init(local = [
+        ep_memory: [u32; 1024] = [0; 0x400],
+        usb_bus: Option<UsbBusAllocator<HalUsb>> = None,
+    ])]
+    fn init(ctx: init::Context) -> (Shared, Local) {
+        let mut core = ctx.core;
+        let dp: pac::Peripherals = ctx.device;
 
-#[unsafe(link_section = ".axisram")]
-static mut EP_MEMORY: [u32; 1024] = [0; 1024];
+        // RCC / clocks
+        let rcc = dp.RCC.constrain();
+        let clocks = rcc
+            .cfgr
+            .sysclk(100.MHz())
+            .require_pll48clk()
+            .freeze();
 
-mod door_state;
-mod mem;
+        // GPIO
+        let gpioa = dp.GPIOA.split();
+        let gpioc = dp.GPIOC.split();
+        let dir_pin = gpioa.pa0.into_push_pull_output();
+        let step_pin = gpioa.pa1.into_push_pull_output();
+        let mut led_pin = gpioc.pc13.into_push_pull_output();
+        // Many F411 "Black Pill" boards have the LED on PC13 active-low; start LED off.
+        let _ = led_pin.set_high();
 
-use crate::door_state::*;
-use crate::mem::*;
+        // USB pins
+        let pa11 = gpioa.pa11.into_alternate::<10>();
+        let pa12 = gpioa.pa12.into_alternate::<10>();
 
-#[global_allocator]
-static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
+        // USB peripheral
+        let usb_periph = otg_fs::USB {
+            usb_global: dp.OTG_FS_GLOBAL,
+            usb_device: dp.OTG_FS_DEVICE,
+            usb_pwrclk: dp.OTG_FS_PWRCLK,
+            pin_dm: hal::gpio::alt::otg_fs::Dm::PA11(pa11),
+            pin_dp: hal::gpio::alt::otg_fs::Dp::PA12(pa12),
+            hclk: clocks.hclk(),
+        };
 
-static mut GT: u32 = 0;
-#[exception]
-fn SysTick() {
-    // Called every 5ms (configured in main)
-    unsafe {GT = GT.wrapping_add(1)};
-    usb_poll_once();
-}
+        // Create the USB bus allocator in an init-local 'static slot so we can get
+        // a &'static UsbBusAllocator for SerialPort/UsbDevice lifetimes.
+        *ctx.local.usb_bus = Some(HalUsb::new(usb_periph, ctx.local.ep_memory));
+        let bus: &'static UsbBusAllocator<HalUsb> = ctx.local.usb_bus.as_ref().unwrap();
 
-#[entry]
-fn main() -> ! {
-    // Take ownership of the peripherals
-    let mut cp = cortex_m::Peripherals::take().unwrap();
-    let dp = pac::Peripherals::take().unwrap();
-
-    // Set up clocks
-    let rcc = dp.RCC.constrain();
-    let clocks = rcc
-        .cfgr
-        // .use_hse(8.MHz()) //that fails.
-        .sysclk(100.MHz())
-        .require_pll48clk()
-        .freeze();
-
-    // Enable GPIOC (for the LED on PC13 on many BlackPill-style boards)
-    let gpioc = dp.GPIOC.split();
-    
-    // USB setup
-
-    // configure PA11/PA12 for OTG FS using the HAL's strong pin wrappers
-    let gpioa = dp.GPIOA.split();
-
-    //configure pins for DRV8825 stepper driver
-    let mut dir_pin = gpioa.pa0.into_push_pull_output(); 
-    let mut step_pin = gpioa.pa1.into_push_pull_output();  
-
-    // Put PA11/PA12 into AF10 (USB OTG FS)
-    let pa11_usb = gpioa.pa11.into_alternate::<10>();
-    let pa12_usb = gpioa.pa12.into_alternate::<10>();
-
-    // Wrap them in the HAL's strong USB pin types
-    let dm = Dm::PA11(pa11_usb);
-    let dpin = Dp::PA12(pa12_usb);
-
-    // Build the low-level OTG FS peripheral
-    let usb_periph = otg_fs::USB {
-        usb_global: dp.OTG_FS_GLOBAL,
-        usb_device: dp.OTG_FS_DEVICE,
-        usb_pwrclk: dp.OTG_FS_PWRCLK,
-        pin_dm: dm,
-        pin_dp: dpin,
-        hclk: clocks.hclk(),
-    };
-
-    // Move everything into statics so they have 'static lifetime
-    unsafe {
-        // Build whatever the HAL thinks the "bus" is
-
-        #[allow(static_mut_refs)]
-        let bus = otg_fs::UsbBus::new(usb_periph, &mut EP_MEMORY);
-
-        // Make an allocator from that bus
-        // IMPORTANT: we are NOT trying to store `bus` separately anymore.
-        // USB_ALLOC.write(UsbBusAllocator::new(bus));
-
-        #[allow(static_mut_refs)]
-        USB_ALLOC.write(bus);
-
-        // Build SerialPort from the allocator we just wrote
-
-        #[allow(static_mut_refs)]
-        let serial = SerialPort::new(USB_ALLOC.assume_init_ref());
-
-        #[allow(static_mut_refs)]
-        USB_SERIAL.write(serial);
-
-        // Build UsbDevice from the same allocator
-
-        #[allow(static_mut_refs)]
-        let usb_dev = UsbDeviceBuilder::new(USB_ALLOC.assume_init_ref(), UsbVidPid(0x16c0, 0x27dd))
-            .device_class(USB_CLASS_CDC)
+        let serial: Serial<'static> = SerialPort::new(bus);
+        let usb_dev: UsbDev<'static> = UsbDeviceBuilder::new(bus, UsbVidPid(0x16c0, 0x27dd))
+            .device_class(usbd_serial::USB_CLASS_CDC)
             .build();
 
-        #[allow(static_mut_refs)]
-        USB_DEV.write(usb_dev);
+        // Configure SysTick (optional if you plan to use it for periodic work)
+        core.SYST.set_clock_source(cortex_m::peripheral::syst::SystClkSource::Core);
+        core.SYST.set_reload(100_000 - 1); // ~1 kHz at 100 MHz
+        core.SYST.clear_current();
+        core.SYST.enable_interrupt();
+        core.SYST.enable_counter();
+
+        (
+            Shared { usb_dev, serial, dir_pin, step_pin, led_pin },
+            Local { }
+        )
     }
 
-    unsafe {
-        // Pick a heap size. Let's say 8 KB for now.
-        // cortex_m_rt gives us `extern "C" { static _sheap: u8; }` / `heap_start()`,
-        // but `CortexMHeap` provides helper.
-        const HEAP_SIZE: usize = 8 * 1024;
-        ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE);
+    // Bind to the USB interrupt to keep the stack serviced
+    #[task(binds = OTG_FS, shared = [usb_dev, serial])]
+    fn usb_irq(ctx: usb_irq::Context) {
+        // Poll the device/class
+        (ctx.shared.usb_dev, ctx.shared.serial).lock(|dev, serial| {
+            let mut classes: [&mut dyn usb_device::class_prelude::UsbClass<HalUsb>; 1] = [serial];
+            let _ = dev.poll(&mut classes);
+        });
     }
 
-    // -------------------------------------------------
-    // Configure SysTick to fire every 5ms
-    //
-    // SysTick runs from core clock (set to 100 MHz above).
-    // 5ms period => 0.005s * 100_000_000 ticks/sec = 500_000 ticks.
-    // Reload register is (ticks - 1).
-    //
-    let syst: &mut SYST = &mut cp.SYST;
-    syst.set_clock_source(SystClkSource::Core);
-    syst.set_reload(500_000 - 1);
-    syst.clear_current();
-    syst.enable_interrupt();
-    syst.enable_counter();
-    // -------------------------------------------------
-
-    // // Read calibration data from flash
-    let calib_data = DoorCalibrationData::read_from_flash();
-    let mut state: Box<dyn State> = match calib_data.is_valid() {
-        true => {
-            // Use the calibration data
-            init_state(calib_data.max_open_steps)
-        }
-        false => {
-            // Handle invalid calibration data (e.g., set defaults or enter error state)
-            calibrate()
-        }
-    };
-
-    // On many STM32F411 "BlackPill"-style boards, PC13 is the user LED.
-    let mut led = gpioc.pc13.into_push_pull_output();
-    let mut tick: u32 = 0;
-
-    //prime things up??
-    for _ in 0..20 {
-        usb_poll_once();
-        asm::delay(500_000);
-    }
-
-
-    // Simple blink loop
-    loop {
-        tick = tick.wrapping_add(1);
-
-        // usb_poll_once();
-
-        if tick % 2_000 == 0 {
-            step_pin.set_high();
-        } 
-        if tick % 4_000 == 0 {
-            step_pin.set_low();
+    // Example: periodic task via SysTick to do logging or stepping
+    #[task(binds = SysTick, local = [ticks: u32 = 0, led_on: bool = false], shared = [dir_pin, step_pin, serial, usb_dev, led_pin])]
+    fn systick(mut ctx: systick::Context) {
+        // Count milliseconds (assuming reload was set for 1 kHz)
+        *ctx.local.ticks += 1;
+        let mut do_blink = false;
+        if *ctx.local.ticks >= 500 {
+            *ctx.local.ticks = 0;
+            do_blink = true;
         }
 
-        if tick % 2_000_000 == 0 {
-            if dir_pin.get_state() == PinState::High {
-                dir_pin.set_low();
-            } else {
-                dir_pin.set_high();
+        // Keep USB serviced every tick; emit message when we blink
+        (ctx.shared.usb_dev, ctx.shared.serial).lock(|dev, serial| {
+            let mut classes: [&mut dyn usb_device::class_prelude::UsbClass<HalUsb>; 1] = [serial];
+            let _ = dev.poll(&mut classes);
+            if do_blink {
+                let _ = serial.write(b"blink\r\n");
             }
+        });
+
+        // Toggle LED on blink (accounting for typical active-low PC13 on BlackPill).
+        if do_blink {
+            (ctx.shared.led_pin).lock(|led| {
+                if *ctx.local.led_on {
+                    let _ = led.set_high(); // off if active-low
+                } else {
+                    let _ = led.set_low();  // on if active-low
+                }
+                *ctx.local.led_on = !*ctx.local.led_on;
+            });
         }
 
-        // blink LED
-        if tick % 500_000 == 0 {
-            led.set_high();
-        }
-        if tick % 1_000_000 == 0 {
-            led.set_low();
-        }
+        // Optional: one step pulse every tick (kept from your example)
+        (ctx.shared.step_pin).lock(|step| {
+            step.set_high();
+            asm::delay(1000);
+            step.set_low();
+        });
+    }
 
-        // throttle logging
-        if tick % 1_000_000 == 0 {
-             usb_log(tick, "main loop alive");
-             unsafe {usb_log(GT, "interrupt driven polls")};
-        }
+    // Your `operate` can be a normal function, or a task you `spawn`.
+    // As a task, it gets safe mutable access to the pins:
+    #[task(shared = [dir_pin, step_pin])]
+    async fn operate(mut ctx: operate::Context, steps: u16, opening: bool) {
+        ctx.shared.dir_pin.lock(|dir| {
+            if opening { dir.set_high(); } else { dir.set_low(); }
+        });
 
-        // if tick > 10_000_000 {
-        //     state = state.run();
-        // }
-
+        ctx.shared.step_pin.lock(|step| {
+            for _ in 0..steps {
+                step.set_high();
+                asm::delay(1000);
+                step.set_low();
+                asm::delay(1000);
+            }
+        });
     }
 }

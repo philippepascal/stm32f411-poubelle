@@ -5,13 +5,19 @@ edition = "2024"
 
 
 [dependencies]
+# RTIC v2 needs a backend feature:
+rtic = { version = "2.2.0", features = ["thumbv7-backend"] }
+
+# Typical Cortex-M deps (versions shown are common & compatible)
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
+
+# Your existing HAL & PAC; make sure the stm32f411 feature is on
+stm32f4xx-hal = { version = "0.22.1", features = ["stm32f411", "usb_fs"] }
 alloc-cortex-m = "0.4"
 # Peripheral Access Crate (auto-generated low-level regs for F411)
-stm32f4 = { version = "0.15", features = ["stm32f411", "rt"] }
+stm32f4 = { version = "0.16", features = ["stm32f411", "rt"] }
 # High-level Hardware Abstraction Layer for stm32f4xx
-stm32f4xx-hal = { version = "0.22.0", features = ["stm32f411", "usb_fs"] }
 panic-halt = "0.2"
 usb-device = "0.3"
 usbd-serial = "0.2.2"
