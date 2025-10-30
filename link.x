@@ -172,15 +172,6 @@ SECTIONS
   . = ALIGN(4);
   __ebss = .;
 
-  /* MANUALLY ADDED to fix linking and remove huge chunk */
-  /* between ram and flash */
-  /* USB endpoint buffer in RAM, but don't include it in the load image */
-  .axisram (NOLOAD) :
-  {
-    *(.axisram)
-    *(.axisram.*)
-  } > RAM
-
   /* ### .uninit */
   .uninit (NOLOAD) : ALIGN(4)
   {

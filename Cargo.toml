@@ -21,6 +21,13 @@ stm32f4 = { version = "0.16", features = ["stm32f411", "rt"] }
 panic-halt = "0.2"
 usb-device = "0.3"
 usbd-serial = "0.2.2"
+#flash stuff
+serde = { version = "1", default-features = false, features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["use-crc"] } # pure no_std
+crc32fast = { version = "1", default-features = false }                        # no_std
+
+[package.metadata.cortex-m-rt]
+memory-x = true
 
 [profile.release]
 panic = "abort"
@@ -28,8 +35,6 @@ codegen-units = 1
 debug = true
 lto = true
 opt-level = "s"
-
-
 
 [profile.dev]
 panic = "abort"

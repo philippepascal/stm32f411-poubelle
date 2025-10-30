@@ -1,7 +1,6 @@
 #![no_std]
 #![no_main]
 
-use cortex_m::asm;
 use stm32f4xx_hal as hal;
 use hal::{
     gpio::{Output, PushPull, gpioa::PA0, gpioa::PA1, gpioc::PC13},
@@ -14,11 +13,16 @@ use panic_halt as _;
 use usb_device::{prelude::*, class_prelude::UsbBusAllocator};
 use usbd_serial::SerialPort;
 use stm32f4xx_hal::otg_fs::UsbBus as HalUsbBus;
+use cortex_m::asm;
+
+mod flash_store;
+use flash_store::{Config, load_config, save_config_blocking};
 
 // --- Type aliases for USB stack
 type HalUsb = HalUsbBus<otg_fs::USB>;
 type UsbDev<'a> = usb_device::device::UsbDevice<'a,HalUsb>;
 type Serial<'a> = usbd_serial::SerialPort<'a,HalUsb>;
+
 
 #[app(device = stm32f4xx_hal::pac, peripherals = true)]
 mod app {
@@ -32,6 +36,7 @@ mod app {
         dir_pin: PA0<Output<PushPull>>,
         step_pin: PA1<Output<PushPull>>,
         led_pin: PC13<Output<PushPull>>,
+        cfg: Config,
     }
 
     // Resources local to specific tasks (not shared)
@@ -89,6 +94,16 @@ mod app {
             .device_class(usbd_serial::USB_CLASS_CDC)
             .build();
 
+        // Try load or use defaults
+        let cfg = load_config().unwrap_or(Config {
+            // step_rate_hz: 1000,
+            // direction_default_opening: true,
+            // pulses_per_rev: 200,
+            travel_step_count: 0,
+        });
+
+        // Later: store flash_writer in Shared so you can call save_config_blocking()
+
         // Configure SysTick (optional if you plan to use it for periodic work)
         core.SYST.set_clock_source(cortex_m::peripheral::syst::SystClkSource::Core);
         core.SYST.set_reload(100_000 - 1); // ~1 kHz at 100 MHz
@@ -97,7 +112,7 @@ mod app {
         core.SYST.enable_counter();
 
         (
-            Shared { usb_dev, serial, dir_pin, step_pin, led_pin },
+            Shared { usb_dev, serial, dir_pin, step_pin, led_pin, cfg },
             Local { }
         )
     }
@@ -168,5 +183,16 @@ mod app {
                 asm::delay(1000);
             }
         });
+    }
+
+    #[task]
+    async fn save_cfg(_ctx: save_cfg::Context, cfg: Config) {
+        let _ = save_config_blocking(&cfg);
+    }
+
+    #[task(shared = [cfg])]
+    async fn persist_cfg(mut ctx: persist_cfg::Context, new_cfg: Config) {
+        ctx.shared.cfg.lock(|c| *c = new_cfg);
+        let _ = save_config_blocking(&new_cfg);
     }
 }
