@@ -1,0 +1,24 @@
+# Install stable Rust if you don't already have it
+curl https://sh.rustup.rs -sSf | sh
+
+# Add the Cortex-M bare-metal target
+rustup target add thumbv7em-none-eabi
+#thumbv7em = Cortex-M4/M7 with floating point instructions available
+#none = no OS
+#eabi = ARM embedded ABI
+#The F411 is an M4F, so that’s the right one.
+
+rustup component add llvm-tools-preview
+cargo install cargo-binutils
+
+cargo new stm32f411-poubelle --bin
+
+brew install arm-none-eabi-gcc openocd
+brew install arm-none-eabi-binutils
+brew install dfu-util
+
+dfu-util -l
+
+//after cargo build --release
+cp target/thumbv7em-none-eabihf/release/build/cortex-m-rt-*/out/link.x link.x
+// edit link.x to reduce flash size despite ram use
