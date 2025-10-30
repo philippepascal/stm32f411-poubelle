@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc_cortex_m::CortexMHeap;
 
-use cortex_m::{asm, delay};
+use cortex_m::asm;
 use cortex_m_rt::entry;
 use panic_halt as _;
 use cortex_m::peripheral::syst::SystClkSource;
@@ -14,6 +14,7 @@ use cortex_m_rt::exception;
 
 use hal::gpio::alt::otg_fs::{Dm, Dp};
 use hal::{otg_fs, pac, prelude::*};
+use stm32f4xx_hal::gpio::PinState;
 use stm32f4xx_hal as hal;
 
 use stm32f4xx_hal::otg_fs::UsbBus as HalUsbBus;
@@ -86,11 +87,11 @@ use crate::mem::*;
 #[global_allocator]
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 
-static mut gt: u32 = 0;
+static mut GT: u32 = 0;
 #[exception]
 fn SysTick() {
     // Called every 5ms (configured in main)
-    unsafe {gt = gt.wrapping_add(1)};
+    unsafe {GT = GT.wrapping_add(1)};
     usb_poll_once();
 }
 
@@ -109,28 +110,18 @@ fn main() -> ! {
         .require_pll48clk()
         .freeze();
 
-    // -------------------------------------------------
-    // Configure SysTick to fire every 5ms
-    //
-    // SysTick runs from core clock (set to 100 MHz above).
-    // 5ms period => 0.005s * 100_000_000 ticks/sec = 500_000 ticks.
-    // Reload register is (ticks - 1).
-    //
-    let syst: &mut SYST = &mut cp.SYST;
-    syst.set_clock_source(SystClkSource::Core);
-    syst.set_reload(500_000 - 1);
-    syst.clear_current();
-    syst.enable_interrupt();
-    syst.enable_counter();
-    // -------------------------------------------------
-
     // Enable GPIOC (for the LED on PC13 on many BlackPill-style boards)
     let gpioc = dp.GPIOC.split();
-
+    
     // USB setup
 
     // configure PA11/PA12 for OTG FS using the HAL's strong pin wrappers
     let gpioa = dp.GPIOA.split();
+
+    //configure pins for DRV8825 stepper driver
+    let mut dir_pin = gpioa.pa0.into_push_pull_output(); 
+    let mut step_pin = gpioa.pa1.into_push_pull_output();  
+
     // Put PA11/PA12 into AF10 (USB OTG FS)
     let pa11_usb = gpioa.pa11.into_alternate::<10>();
     let pa12_usb = gpioa.pa12.into_alternate::<10>();
@@ -190,6 +181,21 @@ fn main() -> ! {
         ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE);
     }
 
+    // -------------------------------------------------
+    // Configure SysTick to fire every 5ms
+    //
+    // SysTick runs from core clock (set to 100 MHz above).
+    // 5ms period => 0.005s * 100_000_000 ticks/sec = 500_000 ticks.
+    // Reload register is (ticks - 1).
+    //
+    let syst: &mut SYST = &mut cp.SYST;
+    syst.set_clock_source(SystClkSource::Core);
+    syst.set_reload(500_000 - 1);
+    syst.clear_current();
+    syst.enable_interrupt();
+    syst.enable_counter();
+    // -------------------------------------------------
+
     // // Read calibration data from flash
     let calib_data = DoorCalibrationData::read_from_flash();
     let mut state: Box<dyn State> = match calib_data.is_valid() {
@@ -208,7 +214,7 @@ fn main() -> ! {
     let mut tick: u32 = 0;
 
     //prime things up??
-    for i in 0..20 {
+    for _ in 0..20 {
         usb_poll_once();
         asm::delay(500_000);
     }
@@ -219,6 +225,21 @@ fn main() -> ! {
         tick = tick.wrapping_add(1);
 
         // usb_poll_once();
+
+        if tick % 2_000 == 0 {
+            step_pin.set_high();
+        } 
+        if tick % 4_000 == 0 {
+            step_pin.set_low();
+        }
+
+        if tick % 2_000_000 == 0 {
+            if dir_pin.get_state() == PinState::High {
+                dir_pin.set_low();
+            } else {
+                dir_pin.set_high();
+            }
+        }
 
         // blink LED
         if tick % 500_000 == 0 {
@@ -231,12 +252,12 @@ fn main() -> ! {
         // throttle logging
         if tick % 1_000_000 == 0 {
              usb_log(tick, "main loop alive");
-             unsafe {usb_log(gt, "interrupt driven polls")};
+             unsafe {usb_log(GT, "interrupt driven polls")};
         }
 
-        if tick > 100_000_000 {
-            state = state.run();
-        }
-        // state = state.run();
+        // if tick > 10_000_000 {
+        //     state = state.run();
+        // }
+
     }
 }
