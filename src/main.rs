@@ -3,7 +3,7 @@
 
 use hal::{
     gpio::{
-        Edge, ExtiPin, Input, Output, PushPull, gpioa::PA0, gpioa::PA1, gpioa::PA6, gpioa::PA7, gpioc::PC13,
+        Edge, ExtiPin, Input, Output, PushPull, gpioa::PA0, gpioa::PA1, gpioa::PA6, gpioa::PA7, gpioa::PA15, gpioc::PC13,
     },
     otg_fs, pac,
     prelude::*,
@@ -57,6 +57,7 @@ mod app {
     #[local]
     struct Local {
         button_pin: PA7<Input>,
+        fault_pin: PA15<Input>,
     }
 
     #[init(local = [
@@ -83,6 +84,9 @@ mod app {
         let mut led_pin = gpioc.pc13.into_push_pull_output();
         // Many F411 "Black Pill" boards have the LED on PC13 active-low; start LED off.
         let _ = led_pin.set_high();
+
+        // DRV8825 FAULT (active-low) on PA15
+        let mut fault_pin = gpioa.pa15.into_pull_up_input();
 
         let mut sleep_pin = gpioa.pa6.into_push_pull_output();
         // Default driver to sleep until we intentionally wake for motion
@@ -127,6 +131,11 @@ mod app {
         button_pin.trigger_on_edge(&mut exti, Edge::Falling);
         button_pin.enable_interrupt(&mut exti);
 
+        // Configure EXTI on PA15 for FAULT (lines 10..15 use EXTI15_10 interrupt)
+        fault_pin.make_interrupt_source(&mut syscfg);
+        fault_pin.trigger_on_edge(&mut exti, Edge::Falling);
+        fault_pin.enable_interrupt(&mut exti);
+
         // Later: store flash_writer in Shared so you can call save_config_blocking()
 
         // Kick off the state machine
@@ -145,7 +154,7 @@ mod app {
                 button_event: false,
                 last_button_ms: 0,
             },
-            Local { button_pin },
+            Local { button_pin, fault_pin },
         )
     }
 
@@ -186,6 +195,20 @@ mod app {
                 accept = true;
             }
         });
+    }
+
+    // FAULT handler: log the event for now. 
+    // Later: disable driver outputs, stop motion, etc.
+    // Note: EXTI lines 10..15 share the same interrupt vector.
+    // Make sure only to bind this if no other pins on those lines are used.
+    // If multiple pins on those lines are used, you'll need to check
+    // which one triggered the interrupt.
+    // This doesn't seem to detect blockage... not sure it's worth doing much with it
+    #[task(binds = EXTI15_10, local = [fault_pin])]
+    fn exti_fault(ctx: exti_fault::Context) {
+        // Clear pending first to avoid immediate retrigger
+        ctx.local.fault_pin.clear_interrupt_pending_bit();
+        let _ = log::spawn(b"-> FAULT asserted\r\n");
     }
 
     #[task(shared = [led_pin, usb_dev, serial])]
