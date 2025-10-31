@@ -3,7 +3,7 @@
 
 use hal::{
     gpio::{
-        Edge, ExtiPin, Input, Output, PushPull, gpioa::PA0, gpioa::PA1, gpioa::PA7, gpioc::PC13,
+        Edge, ExtiPin, Input, Output, PushPull, gpioa::PA0, gpioa::PA1, gpioa::PA6, gpioa::PA7, gpioc::PC13,
     },
     otg_fs, pac,
     prelude::*,
@@ -47,6 +47,7 @@ mod app {
         dir_pin: PA0<Output<PushPull>>,
         step_pin: PA1<Output<PushPull>>,
         led_pin: PC13<Output<PushPull>>,
+        sleep_pin: PA6<Output<PushPull>>, // DRV8825 SLEEP (HIGH = awake, LOW = sleep)
         cfg: Config,
         button_event: bool,
         last_button_ms: u32,
@@ -82,6 +83,10 @@ mod app {
         let mut led_pin = gpioc.pc13.into_push_pull_output();
         // Many F411 "Black Pill" boards have the LED on PC13 active-low; start LED off.
         let _ = led_pin.set_high();
+
+        let mut sleep_pin = gpioa.pa6.into_push_pull_output();
+        // Default driver to sleep until we intentionally wake for motion
+        let _ = sleep_pin.set_low();
 
         // USB pins
         let pa11 = gpioa.pa11.into_alternate::<10>();
@@ -135,6 +140,7 @@ mod app {
                 dir_pin,
                 step_pin,
                 led_pin,
+                sleep_pin,
                 cfg,
                 button_event: false,
                 last_button_ms: 0,
@@ -252,7 +258,7 @@ mod app {
     // Open by stepping `travel_step_count` steps with a trapezoidal profile:
     // 10% accel (slow -> fast), 80% cruise (fast), 10% decel (fast -> slow).
     // Uses busy-wait delays (asm::delay cycles) for simplicity.
-    #[task(shared = [cfg, dir_pin, step_pin, usb_dev, serial])]
+    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, usb_dev, serial])]
     async fn opening(mut ctx: opening::Context) {
         let total_steps: u32 = ctx.shared.cfg.lock(|c| c.travel_step_count as u32);
 
@@ -267,6 +273,7 @@ mod app {
                 });
             },
             || { let _ = wait_open::spawn(); },
+            |on| { ctx.shared.sleep_pin.lock(|s| { let _ = if on { s.set_high() } else { s.set_low() }; }); },
             total_steps,
             b"-> opening\r\n",
             b"-> opened\r\n",
@@ -275,7 +282,7 @@ mod app {
 
     // Close by stepping `travel_step_count` steps with the same trapezoidal profile as `opening`,
     // but with direction LOW, then transition to `wait_closed`.
-    #[task(shared = [cfg, dir_pin, step_pin, usb_dev, serial])]
+    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, usb_dev, serial])]
     async fn closing(mut ctx: closing::Context) {
         let total_steps: u32 = ctx.shared.cfg.lock(|c| c.travel_step_count as u32);
 
@@ -290,6 +297,7 @@ mod app {
                 });
             },
             || { let _ = wait_closed::spawn(); },
+            |on| { ctx.shared.sleep_pin.lock(|s| { let _ = if on { s.set_high() } else { s.set_low() }; }); },
             total_steps,
             b"-> closing\r\n",
             b"-> closed\r\n",
@@ -371,10 +379,11 @@ mod app {
 
 
     // Reusable trapezoid motion helper used by `opening` and `closing`
-    async fn move_trapezoid<SetDir, Pulse, Next>(
+    async fn move_trapezoid<SetDir, Pulse, Next, SetSleep>(
         mut set_direction: SetDir,
         mut pulse: Pulse,
         mut spawn_next: Next,
+        mut set_sleep: SetSleep,
         total_steps: u32,
         start_label: &'static [u8],
         done_label: &'static [u8],
@@ -383,12 +392,15 @@ mod app {
         SetDir: FnMut(),
         Pulse: FnMut(u32),
         Next: FnMut(),
+        SetSleep: FnMut(bool),
     {
         if total_steps == 0 {
             // No motion needed; transition immediately
             spawn_next();
             return;
         }
+
+        set_sleep(true); // wake driver
 
         let _ = log::spawn(start_label);
         Mono::delay(10_u32.millis()).await; // let USB breathe
@@ -441,6 +453,7 @@ mod app {
         }
 
         let _ = log::spawn(done_label);
+        set_sleep(false); // sleep driver
         spawn_next();
     }
 }
