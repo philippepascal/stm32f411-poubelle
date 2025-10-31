@@ -22,3 +22,39 @@ dfu-util -l
 //after cargo build --release
 cp target/thumbv7em-none-eabihf/release/build/cortex-m-rt-*/out/link.x link.x
 // edit link.x to reduce flash size despite ram use
+
+----------------------------------------------------------------
+on the STM32F411 you have quite a few EXTI-capable pins, but only 16 interrupt lines (EXTI0–EXTI15).
+Each line is shared across all GPIO ports (so PA0 and PB0 both map to EXTI0).
+You can have up to 16 concurrent interrupts, one per EXTI line number.
+
+You’re already using:
+	•	PA7 → EXTI9_5 (lines 5–9 group)
+	•	PA15 → EXTI15_10 (lines 10–15 group)
+
+So lines 7 and 15 are taken.
+
+You can safely add two more on any other unused EXTI line numbers (0–6, 8–14 except 7 and 15).
+For example, on your STM32F411 “Black Pill” you might use:
+Pin
+EXTI Line
+IRQ Vector
+Notes
+PA0     0   EXTI0   Currently used for DIR → not suitable unless re-routed
+PA1     1   EXTI1   Currently used for STEP → not suitable
+PA2     2   EXTI2   Free (good choice)
+PA3     3   EXTI3   Free (good choice)
+PA4     4   EXTI4   Free
+PA5     5   EXTI9_5 Shares vector with PA7, but you can handle both in the same handler
+PA8–PA9 8–9 EXTI9_5 Same group as PA7, shared vector
+PA10–PA14   10–14   EXTI15_10   Shares vector with PA15
+
+	If you want completely separate handlers (cleanest):
+	•	PA2 → EXTI2 IRQ
+	•	PA3 → EXTI3 IRQ
+	•	If you don’t mind shared handlers (multiple pins per vector):
+	•	You can use PA8 or PA9 (shared with PA7’s EXTI9_5).
+	•	Or PA10–PA14 (shared with PA15’s EXTI15_10).
+
+So for two more distinct interrupts, the simplest and least-conflicting choices are PA2 and PA3.
+----------------------------------------------------------------
