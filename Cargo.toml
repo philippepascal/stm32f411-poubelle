@@ -6,7 +6,7 @@ edition = "2024"
 
 [dependencies]
 # RTIC v2 needs a backend feature:
-rtic = { version = "2.2.0", features = ["thumbv7-backend"] }
+rtic = { version = "2.2", features = ["thumbv7-backend"] }
 
 # Typical Cortex-M deps (versions shown are common & compatible)
 cortex-m = "0.7"
@@ -25,6 +25,12 @@ usbd-serial = "0.2.2"
 serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-crc"] } # pure no_std
 crc32fast = { version = "1", default-features = false }                        # no_std
+#monotonic for async tasks
+rtic-monotonics = { version="2.1", features = ["cortex-m-systick"] }
+systick-monotonic = "1.0"
+dwt-systick-monotonic = "1.1"
+rtic-time = "1"
+fugit = "0.3"
 
 [package.metadata.cortex-m-rt]
 memory-x = true

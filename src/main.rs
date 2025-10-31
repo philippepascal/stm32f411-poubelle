@@ -9,6 +9,7 @@ use hal::{
     prelude::*,
 };
 use rtic::app;
+
 use panic_halt as _;
 use usb_device::{prelude::*, class_prelude::UsbBusAllocator};
 use usbd_serial::SerialPort;
@@ -23,11 +24,19 @@ type HalUsb = HalUsbBus<otg_fs::USB>;
 type UsbDev<'a> = usb_device::device::UsbDevice<'a,HalUsb>;
 type Serial<'a> = usbd_serial::SerialPort<'a,HalUsb>;
 
+use rtic_monotonics::systick::prelude::*;
 
-#[app(device = stm32f4xx_hal::pac, peripherals = true)]
+systick_monotonic!(Mono, 1000);
+
+#[app(
+    device = stm32f4xx_hal::pac,
+    peripherals = true,
+)]
 mod app {
 
     use super::*;
+    use rtic_monotonics::Monotonic;
+    use fugit::ExtU32; // enables 10_u32.millis(), 500_u32.millis()
 
     // Resources shared across tasks (RTIC locks these automatically)
     #[shared]
@@ -39,6 +48,7 @@ mod app {
         led_pin: PC13<Output<PushPull>>,
         cfg: Config,
         button_event: bool,
+        last_button_ms: u32,
     }
 
     // Resources local to specific tasks (not shared)
@@ -52,7 +62,7 @@ mod app {
         usb_bus: Option<UsbBusAllocator<HalUsb>> = None,
     ])]
     fn init(ctx: init::Context) -> (Shared, Local) {
-        let mut core = ctx.core;
+        let core = ctx.core;
         let dp: pac::Peripherals = ctx.device;
 
         // RCC / clocks
@@ -62,6 +72,10 @@ mod app {
             .sysclk(100.MHz())
             .require_pll48clk()
             .freeze();
+
+
+        // Initialize the systick interrupt & obtain the token to prove that we did
+        Mono::start(core.SYST, clocks.sysclk().to_Hz());
 
         // GPIO
         let gpioa = dp.GPIOA.split();
@@ -114,19 +128,13 @@ mod app {
 
         // Later: store flash_writer in Shared so you can call save_config_blocking()
 
-        // Configure SysTick (optional if you plan to use it for periodic work)
-        core.SYST.set_clock_source(cortex_m::peripheral::syst::SystClkSource::Core);
-        core.SYST.set_reload(100_000 - 1); // ~1 kHz at 100 MHz
-        core.SYST.clear_current();
-        core.SYST.enable_interrupt();
-        core.SYST.enable_counter();
-
         // Kick off the state machine
+        let _ = heartbeat::spawn();
         let _ = start_door::spawn();
 
         (
-            Shared { usb_dev, serial, dir_pin, step_pin, led_pin, cfg, button_event: false },
-            Local { button_pin }
+            Shared { usb_dev, serial, dir_pin, step_pin, led_pin, cfg, button_event: false, last_button_ms: 0 },
+            Local { button_pin },
         )
     }
 
@@ -139,6 +147,7 @@ mod app {
             let _ = dev.poll(&mut classes);
         });
     }
+    
     // Async logger: write a static message to USB serial safely
     #[task(shared = [usb_dev, serial])]
     async fn log(ctx: log::Context, msg: &'static [u8]) {
@@ -148,57 +157,49 @@ mod app {
             let _ = serial.write(msg);
         });
     }
-    #[task(binds = EXTI9_5, local = [button_pin], shared = [button_event])]
-    fn exti_irq(mut ctx: exti_irq::Context) {
-        // Clear the interrupt first
+
+    #[task(binds = EXTI9_5, local = [button_pin], shared = [button_event, last_button_ms])]
+    fn exti_irq(ctx: exti_irq::Context) {
+        // Clear the line's pending flag first
         ctx.local.button_pin.clear_interrupt_pending_bit();
-        // Set the shared event flag
-        ctx.shared.button_event.lock(|f| *f = true);
-    }
 
-    // Example: periodic task via SysTick to do logging or stepping
-    #[task(binds = SysTick, local = [ticks: u32 = 0, led_on: bool = false], shared = [dir_pin, step_pin, serial, usb_dev, led_pin, button_event])]
-    fn systick(mut ctx: systick::Context) {
-        // Count milliseconds (assuming reload was set for 1 kHz)
-        *ctx.local.ticks += 1;
-        let mut do_blink = false;
-        if *ctx.local.ticks >= 500 {
-            *ctx.local.ticks = 0;
-            do_blink = true;
-        }
-
-        // // Check and consume button event (edge-triggered)
-        // let mut got_button = false;
-        // ctx.shared.button_event.lock(|f| { if *f { *f = false; got_button = true; } });
-
-        // Keep USB serviced every tick; emit message when we blink
-        (ctx.shared.usb_dev, ctx.shared.serial).lock(|dev, serial| {
-            let mut classes: [&mut dyn usb_device::class_prelude::UsbClass<HalUsb>; 1] = [serial];
-            let _ = dev.poll(&mut classes);
-            if do_blink { let _ = serial.write(b"blink\r\n"); }
-            // if got_button { let _ = serial.write(b"button\r\n"); }
+        // Simple debounce: only accept one event per 50 ms window
+        let now_ms: u32 = Mono::now().ticks(); // 1 kHz monotonic → ticks are milliseconds?
+        let mut accept = false;
+        (ctx.shared.last_button_ms, ctx.shared.button_event).lock(|last_ms, evt| {
+            let dt = now_ms.wrapping_sub(*last_ms);
+            if dt >= 500 { // 500ms? debounce
+                *last_ms = now_ms;
+                *evt = true;
+                accept = true;
+            }
         });
-
-        // Toggle LED on blink (accounting for typical active-low PC13 on BlackPill).
-        if do_blink {
-            (ctx.shared.led_pin).lock(|led| {
-                if *ctx.local.led_on {
-                    let _ = led.set_high(); // off if active-low
-                } else {
-                    let _ = led.set_low();  // on if active-low
-                }
-                *ctx.local.led_on = !*ctx.local.led_on;
-            });
-        }
-
-        // Optional: one step pulse every tick (kept from your example)
-        // keep commented for testing
-        // (ctx.shared.step_pin).lock(|step| {
-        //     step.set_high();
-        //     asm::delay(1000);
-        //     step.set_low();
-        // });
     }
+
+    #[task(shared = [led_pin, usb_dev, serial])]
+    async fn heartbeat(mut ctx: heartbeat::Context) {
+        let mut led_on = false;
+        let mut divider = 0;
+        loop {
+            // sleep/yield to the RTIC executor
+            Mono::delay(500_u32.millis()).await;
+
+            divider += 1;
+
+            // toggle LED (PC13 is typically active-low on BlackPill)
+            ctx.shared.led_pin.lock(|led| {
+                if led_on { let _ = led.set_high(); } else { let _ = led.set_low(); }
+                led_on = !led_on;
+            });
+
+            // keep USB serviced and (optionally) log a blink line
+            if divider % 10 == 0 {
+                let _ = log::spawn(b"-> heartbeat\r\n");
+                divider = 0;
+            }
+        }
+    }
+
 
     // Your `operate` can be a normal function, or a task you `spawn`.
     // As a task, it gets safe mutable access to the pins:
@@ -260,27 +261,24 @@ mod app {
     // Wait for button event, then spawn opening task
     #[task(shared = [button_event, usb_dev, serial])]
     async fn wait_closed(mut ctx: wait_closed::Context) {
-        let _ = log::spawn(b"-> wait closed\r\n");
-        let mut ms = 0u32;
+        let _ = log::spawn(b"-> transitioned to wait closed\r\n");
+        let mut elapsed_ms: u32 = 0;
         loop {
-            // Consume the edge-triggered button event
+            Mono::delay(10_u32.millis()).await; // yield ~10ms
+            elapsed_ms = elapsed_ms.wrapping_add(10);
+
             let mut got = false;
             ctx.shared.button_event.lock(|f| { if *f { *f = false; got = true; } });
-
             if got {
                 let _ = opening::spawn();
-                return; // end wait_closed
+                let _ = log::spawn(b"-> transitioned out of wait closed\r\n");
+                return;
             }
 
-            // Heartbeat log every ~1000 ms
-            ms = ms.wrapping_add(1);
-            if ms >= 1000 {
-                ms = 0;
+            if elapsed_ms >= 1000 {
+                elapsed_ms = 0;
                 let _ = log::spawn(b"-> wait closed\r\n");
             }
-
-            // Small cooperative delay to avoid tight spinning (~1ms at 100 MHz)
-            asm::delay(100_000);
         }
     }
 
@@ -299,10 +297,11 @@ mod app {
 
         // Log start
         let _ = log::spawn(b"-> opening\r\n");
+        Mono::delay(10_u32.millis()).await; // yield ~10ms
 
         // Timing constants (tune for your mechanics and sysclk)
-        const SLOW_DELAY: u32 = 20_000; // ~200 µs half-period (≈ 2.5 kHz)
-        const FAST_DELAY: u32 = 3_000;  // ~30  µs half-period  (≈ 16.7 kHz)
+        const SLOW_DELAY: u32 = 120_000; // ~60 µs half-period  (≈ 8.3 kHz)
+        const FAST_DELAY: u32 = 25_000;  //    ~30 µs half-period  (≈16.6 kHz)
 
         // Phase partitioning: 10% accel, 80% cruise, 10% decel
         let mut accel = core::cmp::max(1, total_steps / 10);
@@ -313,17 +312,11 @@ mod app {
         // Set direction HIGH once
         ctx.shared.dir_pin.lock(|dir| { dir.set_high(); });
 
-        // Progress tracking (log at 10%,20%,...,90%)
-        let mut steps_done: u32 = 0;
-        let mut next_pct: u32 = 10;
-        let marks: [&[u8]; 9] = [
-            b"10%\r\n", b"20%\r\n", b"30%\r\n", b"40%\r\n", b"50%\r\n",
-            b"60%\r\n", b"70%\r\n", b"80%\r\n", b"90%\r\n",
-        ];
-        let mut mark_idx = 0usize;
+        let _ = log::spawn(b"-> opening; direction set\r\n");
+        Mono::delay(10_u32.millis()).await; // yield ~10ms -useful for logging and not overwhelming stepper
 
         // Helper: do one pulse and maybe log progress
-        let mut pulse = |delay: u32, ctx: &mut opening::Context| {
+        let pulse = |delay: u32, ctx: &mut opening::Context| {
             // emit one step pulse
             ctx.shared.step_pin.lock(|step| {
                 step.set_high();
@@ -331,15 +324,10 @@ mod app {
                 step.set_low();
                 asm::delay(delay);
             });
-            steps_done = steps_done.saturating_add(1);
-
-            // check progress milestone
-            if mark_idx < marks.len() && steps_done.saturating_mul(100) / total_steps >= next_pct {
-                let _ = log::spawn(marks[mark_idx]);
-                next_pct += 10;
-                mark_idx += 1;
-            }
         };
+
+        let _ = log::spawn(b"-> opening; ready to accel\r\n");
+        Mono::delay(10_u32.millis()).await; // yield ~10ms
 
         // Accel: linearly interpolate SLOW -> FAST
         if accel > 0 {
@@ -350,8 +338,14 @@ mod app {
             }
         }
 
+        let _ = log::spawn(b"-> opening; ready to cruise\r\n");
+        Mono::delay(10_u32.millis()).await; // yield ~10ms
+
         // Cruise at FAST
         for _ in 0..cruise { pulse(FAST_DELAY, &mut ctx); }
+
+        let _ = log::spawn(b"-> opening; ready to decel\r\n");
+        Mono::delay(10_u32.millis()).await; // yield ~10ms
 
         // Decel: linearly interpolate FAST -> SLOW
         if decel > 0 {
@@ -369,17 +363,24 @@ mod app {
     // Wait for button event while door is open; on event, spawn `closing` and exit
     #[task(shared = [button_event, usb_dev, serial])]
     async fn wait_open(mut ctx: wait_open::Context) {
+        let _ = log::spawn(b"-> transitioned to wait open\r\n");
+        let mut elapsed_ms: u32 = 0;
         loop {
+            Mono::delay(10_u32.millis()).await; // yield ~10ms
+            elapsed_ms = elapsed_ms.wrapping_add(10);
+
             let mut got = false;
             ctx.shared.button_event.lock(|f| { if *f { *f = false; got = true; } });
-
             if got {
-                let _ = log::spawn(b"-> closing\r\n");
                 let _ = closing::spawn();
+                let _ = log::spawn(b"-> transitioned out of wait open\r\n");
                 return;
             }
 
-            asm::delay(100_000); // ~1ms at 100 MHz; adjust as needed
+            if elapsed_ms >= 1000 {
+                elapsed_ms = 0;
+                let _ = log::spawn(b"-> wait open\r\n");
+            }
         }
     }
 
@@ -396,8 +397,8 @@ mod app {
         // Log start
         let _ = log::spawn(b"-> closing\r\n");
 
-        const SLOW_DELAY: u32 = 20_000;
-        const FAST_DELAY: u32 = 3_000;
+        const SLOW_DELAY: u32 = 120_000;
+        const FAST_DELAY: u32 = 25_000;
 
         let mut accel = core::cmp::max(1, total_steps / 10);
         let mut decel = accel;
