@@ -1,28 +1,29 @@
 #![no_std]
 #![no_main]
 
-use stm32f4xx_hal as hal;
 use hal::{
-    gpio::{Output, PushPull, Input, ExtiPin, Edge, gpioa::PA0, gpioa::PA1, gpioa::PA7, gpioc::PC13},
-    otg_fs,
-    pac,
+    gpio::{
+        Edge, ExtiPin, Input, Output, PushPull, gpioa::PA0, gpioa::PA1, gpioa::PA7, gpioc::PC13,
+    },
+    otg_fs, pac,
     prelude::*,
 };
 use rtic::app;
+use stm32f4xx_hal as hal;
 
-use panic_halt as _;
-use usb_device::{prelude::*, class_prelude::UsbBusAllocator};
-use usbd_serial::SerialPort;
-use stm32f4xx_hal::otg_fs::UsbBus as HalUsbBus;
 use cortex_m::asm;
+use panic_halt as _;
+use stm32f4xx_hal::otg_fs::UsbBus as HalUsbBus;
+use usb_device::{class_prelude::UsbBusAllocator, prelude::*};
+use usbd_serial::SerialPort;
 
 mod flash_store;
 use flash_store::{Config, load_config, save_config_blocking};
 
 // --- Type aliases for USB stack
 type HalUsb = HalUsbBus<otg_fs::USB>;
-type UsbDev<'a> = usb_device::device::UsbDevice<'a,HalUsb>;
-type Serial<'a> = usbd_serial::SerialPort<'a,HalUsb>;
+type UsbDev<'a> = usb_device::device::UsbDevice<'a, HalUsb>;
+type Serial<'a> = usbd_serial::SerialPort<'a, HalUsb>;
 
 use rtic_monotonics::systick::prelude::*;
 
@@ -35,14 +36,14 @@ systick_monotonic!(Mono, 1000);
 mod app {
 
     use super::*;
-    use rtic_monotonics::Monotonic;
-    use fugit::ExtU32; // enables 10_u32.millis(), 500_u32.millis()
+    use fugit::ExtU32;
+    use rtic_monotonics::Monotonic; // enables 10_u32.millis(), 500_u32.millis()
 
     // Resources shared across tasks (RTIC locks these automatically)
     #[shared]
     struct Shared {
         usb_dev: UsbDev<'static>,
-        serial: SerialPort<'static,HalUsb>,
+        serial: SerialPort<'static, HalUsb>,
         dir_pin: PA0<Output<PushPull>>,
         step_pin: PA1<Output<PushPull>>,
         led_pin: PC13<Output<PushPull>>,
@@ -67,12 +68,7 @@ mod app {
 
         // RCC / clocks
         let rcc = dp.RCC.constrain();
-        let clocks = rcc
-            .cfgr
-            .sysclk(100.MHz())
-            .require_pll48clk()
-            .freeze();
-
+        let clocks = rcc.cfgr.sysclk(100.MHz()).require_pll48clk().freeze();
 
         // Initialize the systick interrupt & obtain the token to prove that we did
         Mono::start(core.SYST, clocks.sysclk().to_Hz());
@@ -133,7 +129,16 @@ mod app {
         let _ = start_door::spawn();
 
         (
-            Shared { usb_dev, serial, dir_pin, step_pin, led_pin, cfg, button_event: false, last_button_ms: 0 },
+            Shared {
+                usb_dev,
+                serial,
+                dir_pin,
+                step_pin,
+                led_pin,
+                cfg,
+                button_event: false,
+                last_button_ms: 0,
+            },
             Local { button_pin },
         )
     }
@@ -147,7 +152,7 @@ mod app {
             let _ = dev.poll(&mut classes);
         });
     }
-    
+
     // Async logger: write a static message to USB serial safely
     #[task(shared = [usb_dev, serial])]
     async fn log(ctx: log::Context, msg: &'static [u8]) {
@@ -168,7 +173,8 @@ mod app {
         let mut accept = false;
         (ctx.shared.last_button_ms, ctx.shared.button_event).lock(|last_ms, evt| {
             let dt = now_ms.wrapping_sub(*last_ms);
-            if dt >= 500 { // 500ms? debounce
+            if dt >= 500 {
+                // 500ms? debounce
                 *last_ms = now_ms;
                 *evt = true;
                 accept = true;
@@ -188,7 +194,11 @@ mod app {
 
             // toggle LED (PC13 is typically active-low on BlackPill)
             ctx.shared.led_pin.lock(|led| {
-                if led_on { let _ = led.set_high(); } else { let _ = led.set_low(); }
+                if led_on {
+                    let _ = led.set_high();
+                } else {
+                    let _ = led.set_low();
+                }
                 led_on = !led_on;
             });
 
@@ -198,25 +208,6 @@ mod app {
                 divider = 0;
             }
         }
-    }
-
-
-    // Your `operate` can be a normal function, or a task you `spawn`.
-    // As a task, it gets safe mutable access to the pins:
-    #[task(shared = [dir_pin, step_pin])]
-    async fn operate(mut ctx: operate::Context, steps: u16, opening: bool) {
-        ctx.shared.dir_pin.lock(|dir| {
-            if opening { dir.set_high(); } else { dir.set_low(); }
-        });
-
-        ctx.shared.step_pin.lock(|step| {
-            for _ in 0..steps {
-                step.set_high();
-                asm::delay(1000);
-                step.set_low();
-                asm::delay(1000);
-            }
-        });
     }
 
     #[task]
@@ -258,130 +249,28 @@ mod app {
         let _ = wait_closed::spawn();
     }
 
-    // Wait for button event, then spawn opening task
-    #[task(shared = [button_event, usb_dev, serial])]
-    async fn wait_closed(mut ctx: wait_closed::Context) {
-        let _ = log::spawn(b"-> transitioned to wait closed\r\n");
-        let mut elapsed_ms: u32 = 0;
-        loop {
-            Mono::delay(10_u32.millis()).await; // yield ~10ms
-            elapsed_ms = elapsed_ms.wrapping_add(10);
-
-            let mut got = false;
-            ctx.shared.button_event.lock(|f| { if *f { *f = false; got = true; } });
-            if got {
-                let _ = opening::spawn();
-                let _ = log::spawn(b"-> transitioned out of wait closed\r\n");
-                return;
-            }
-
-            if elapsed_ms >= 1000 {
-                elapsed_ms = 0;
-                let _ = log::spawn(b"-> wait closed\r\n");
-            }
-        }
-    }
-
     // Open by stepping `travel_step_count` steps with a trapezoidal profile:
     // 10% accel (slow -> fast), 80% cruise (fast), 10% decel (fast -> slow).
     // Uses busy-wait delays (asm::delay cycles) for simplicity.
     #[task(shared = [cfg, dir_pin, step_pin, usb_dev, serial])]
     async fn opening(mut ctx: opening::Context) {
-        // Read number of steps from config
         let total_steps: u32 = ctx.shared.cfg.lock(|c| c.travel_step_count as u32);
-        if total_steps == 0 {
-            // No motion needed; transition immediately
-            let _ = wait_open::spawn();
-            return;
-        }
 
-        // Log start
-        let _ = log::spawn(b"-> opening\r\n");
-        Mono::delay(10_u32.millis()).await; // yield ~10ms
-
-        // Timing constants (tune for your mechanics and sysclk)
-        const SLOW_DELAY: u32 = 120_000; // ~60 µs half-period  (≈ 8.3 kHz)
-        const FAST_DELAY: u32 = 25_000;  //    ~30 µs half-period  (≈16.6 kHz)
-
-        // Phase partitioning: 10% accel, 80% cruise, 10% decel
-        let mut accel = core::cmp::max(1, total_steps / 10);
-        let mut decel = accel;
-        if accel * 2 > total_steps { accel = total_steps / 2; decel = total_steps - accel; }
-        let cruise = total_steps.saturating_sub(accel + decel);
-
-        // Set direction HIGH once
-        ctx.shared.dir_pin.lock(|dir| { dir.set_high(); });
-
-        let _ = log::spawn(b"-> opening; direction set\r\n");
-        Mono::delay(10_u32.millis()).await; // yield ~10ms -useful for logging and not overwhelming stepper
-
-        // Helper: do one pulse and maybe log progress
-        let pulse = |delay: u32, ctx: &mut opening::Context| {
-            // emit one step pulse
-            ctx.shared.step_pin.lock(|step| {
-                step.set_high();
-                asm::delay(delay);
-                step.set_low();
-                asm::delay(delay);
-            });
-        };
-
-        let _ = log::spawn(b"-> opening; ready to accel\r\n");
-        Mono::delay(10_u32.millis()).await; // yield ~10ms
-
-        // Accel: linearly interpolate SLOW -> FAST
-        if accel > 0 {
-            let span = SLOW_DELAY.saturating_sub(FAST_DELAY);
-            for i in 0..accel {
-                let d = if accel > 1 { SLOW_DELAY.saturating_sub((span * i) / (accel - 1)) } else { SLOW_DELAY };
-                pulse(d, &mut ctx);
-            }
-        }
-
-        let _ = log::spawn(b"-> opening; ready to cruise\r\n");
-        Mono::delay(10_u32.millis()).await; // yield ~10ms
-
-        // Cruise at FAST
-        for _ in 0..cruise { pulse(FAST_DELAY, &mut ctx); }
-
-        let _ = log::spawn(b"-> opening; ready to decel\r\n");
-        Mono::delay(10_u32.millis()).await; // yield ~10ms
-
-        // Decel: linearly interpolate FAST -> SLOW
-        if decel > 0 {
-            let span = SLOW_DELAY.saturating_sub(FAST_DELAY);
-            for i in 0..decel {
-                let d = if decel > 1 { FAST_DELAY.saturating_add((span * i) / (decel - 1)) } else { SLOW_DELAY };
-                pulse(d, &mut ctx);
-            }
-        }
-
-        // Transition to next state once motion completes
-        let _ = wait_open::spawn();
-    }
-
-    // Wait for button event while door is open; on event, spawn `closing` and exit
-    #[task(shared = [button_event, usb_dev, serial])]
-    async fn wait_open(mut ctx: wait_open::Context) {
-        let _ = log::spawn(b"-> transitioned to wait open\r\n");
-        let mut elapsed_ms: u32 = 0;
-        loop {
-            Mono::delay(10_u32.millis()).await; // yield ~10ms
-            elapsed_ms = elapsed_ms.wrapping_add(10);
-
-            let mut got = false;
-            ctx.shared.button_event.lock(|f| { if *f { *f = false; got = true; } });
-            if got {
-                let _ = closing::spawn();
-                let _ = log::spawn(b"-> transitioned out of wait open\r\n");
-                return;
-            }
-
-            if elapsed_ms >= 1000 {
-                elapsed_ms = 0;
-                let _ = log::spawn(b"-> wait open\r\n");
-            }
-        }
+        move_trapezoid(
+            || { ctx.shared.dir_pin.lock(|dir| { dir.set_high(); }); },
+            |delay| {
+                ctx.shared.step_pin.lock(|step| {
+                    step.set_high();
+                    asm::delay(delay);
+                    step.set_low();
+                    asm::delay(delay);
+                });
+            },
+            || { let _ = wait_open::spawn(); },
+            total_steps,
+            b"-> opening\r\n",
+            b"-> opened\r\n",
+        ).await;
     }
 
     // Close by stepping `travel_step_count` steps with the same trapezoidal profile as `opening`,
@@ -389,63 +278,169 @@ mod app {
     #[task(shared = [cfg, dir_pin, step_pin, usb_dev, serial])]
     async fn closing(mut ctx: closing::Context) {
         let total_steps: u32 = ctx.shared.cfg.lock(|c| c.travel_step_count as u32);
+
+        move_trapezoid(
+            || { ctx.shared.dir_pin.lock(|dir| { dir.set_low(); }); },
+            |delay| {
+                ctx.shared.step_pin.lock(|step| {
+                    step.set_high();
+                    asm::delay(delay);
+                    step.set_low();
+                    asm::delay(delay);
+                });
+            },
+            || { let _ = wait_closed::spawn(); },
+            total_steps,
+            b"-> closing\r\n",
+            b"-> closed\r\n",
+        ).await;
+    }
+
+    #[task(shared = [button_event, usb_dev, serial])]
+    async fn wait_open(mut ctx: wait_open::Context) {
+        wait_state!(
+            ctx,
+            closing,
+            b"-> transitioned to wait open\r\n",
+            b"-> wait open\r\n",
+            b"-> transitioned out of wait open\r\n"
+        );
+    }
+
+    #[task(shared = [button_event, usb_dev, serial])]
+    async fn wait_closed(mut ctx: wait_closed::Context) {
+        wait_state!(
+            ctx,
+            opening,
+            b"-> transitioned to wait closed\r\n",
+            b"-> wait closed\r\n",
+            b"-> transitioned out of wait closed\r\n"
+        );
+    }
+
+    // shared async helper 
+    async fn wait_common(
+        mut take_event: impl FnMut() -> bool,
+        mut spawn_next: impl FnMut(),
+        enter: &'static [u8],
+        beat: &'static [u8],
+        exit: &'static [u8],
+    ) {
+        let _ = log::spawn(enter);
+        let mut ms = 0u32;
+        loop {
+            Mono::delay(10_u32.millis()).await;
+            ms = ms.wrapping_add(10);
+
+            if take_event() {
+                spawn_next();
+                let _ = log::spawn(exit);
+                return;
+            }
+            if ms >= 1000 {
+                ms = 0;
+                let _ = log::spawn(beat);
+            }
+        }
+    }
+
+    // macro that *uses* the helper inside a task
+    macro_rules! wait_state {
+        ($ctx:ident, $next:ident, $enter:expr, $beat:expr, $exit:expr $(,)?) => {{
+            wait_common(
+                || {
+                    let mut got = false;
+                    $ctx.shared.button_event.lock(|f| {
+                        if *f {
+                            *f = false;
+                            got = true;
+                        }
+                    });
+                    got
+                },
+                || {
+                    let _ = $next::spawn();
+                },
+                $enter,
+                $beat,
+                $exit,
+            )
+            .await;
+        }};
+    }
+
+
+    // Reusable trapezoid motion helper used by `opening` and `closing`
+    async fn move_trapezoid<SetDir, Pulse, Next>(
+        mut set_direction: SetDir,
+        mut pulse: Pulse,
+        mut spawn_next: Next,
+        total_steps: u32,
+        start_label: &'static [u8],
+        done_label: &'static [u8],
+    )
+    where
+        SetDir: FnMut(),
+        Pulse: FnMut(u32),
+        Next: FnMut(),
+    {
         if total_steps == 0 {
-            let _ = wait_closed::spawn();
+            // No motion needed; transition immediately
+            spawn_next();
             return;
         }
 
-        // Log start
-        let _ = log::spawn(b"-> closing\r\n");
+        let _ = log::spawn(start_label);
+        Mono::delay(10_u32.millis()).await; // let USB breathe
 
-        const SLOW_DELAY: u32 = 120_000;
-        const FAST_DELAY: u32 = 25_000;
+        // Timing constants (tune for your mechanics and sysclk)
+        const SLOW_DELAY: u32 = 120_000; // ~60 µs half-period
+        const FAST_DELAY: u32 = 25_000;  // ~30 µs half-period
 
+        // Phase partitioning: 10% accel, 80% cruise, 10% decel
         let mut accel = core::cmp::max(1, total_steps / 10);
         let mut decel = accel;
-        if accel * 2 > total_steps { accel = total_steps / 2; decel = total_steps - accel; }
+        if accel * 2 > total_steps {
+            accel = total_steps / 2;
+            decel = total_steps - accel;
+        }
         let cruise = total_steps.saturating_sub(accel + decel);
 
-        ctx.shared.dir_pin.lock(|dir| { dir.set_low(); });
+        // Direction once up-front
+        set_direction();
 
-        let mut steps_done: u32 = 0;
-        let mut next_pct: u32 = 10;
-        let marks: [&[u8]; 9] = [
-            b"10%\r\n", b"20%\r\n", b"30%\r\n", b"40%\r\n", b"50%\r\n",
-            b"60%\r\n", b"70%\r\n", b"80%\r\n", b"90%\r\n",
-        ];
-        let mut mark_idx = 0usize;
-
-        let mut pulse = |delay: u32, ctx: &mut closing::Context| {
-            ctx.shared.step_pin.lock(|step| {
-                step.set_high();
-                asm::delay(delay);
-                step.set_low();
-                asm::delay(delay);
-            });
-            steps_done = steps_done.saturating_add(1);
-            if mark_idx < marks.len() && steps_done.saturating_mul(100) / total_steps >= next_pct {
-                let _ = log::spawn(marks[mark_idx]);
-                next_pct += 10;
-                mark_idx += 1;
-            }
-        };
-
+        // Accel: SLOW -> FAST
         if accel > 0 {
             let span = SLOW_DELAY.saturating_sub(FAST_DELAY);
             for i in 0..accel {
-                let d = if accel > 1 { SLOW_DELAY.saturating_sub((span * i) / (accel - 1)) } else { SLOW_DELAY };
-                pulse(d, &mut ctx);
-            }
-        }
-        for _ in 0..cruise { pulse(FAST_DELAY, &mut ctx); }
-        if decel > 0 {
-            let span = SLOW_DELAY.saturating_sub(FAST_DELAY);
-            for i in 0..decel {
-                let d = if decel > 1 { FAST_DELAY.saturating_add((span * i) / (decel - 1)) } else { SLOW_DELAY };
-                pulse(d, &mut ctx);
+                let d = if accel > 1 {
+                    SLOW_DELAY.saturating_sub((span * i) / (accel - 1))
+                } else {
+                    SLOW_DELAY
+                };
+                pulse(d);
             }
         }
 
-        let _ = wait_closed::spawn();
+        // Cruise at FAST
+        for _ in 0..cruise {
+            pulse(FAST_DELAY);
+        }
+
+        // Decel: FAST -> SLOW
+        if decel > 0 {
+            let span = SLOW_DELAY.saturating_sub(FAST_DELAY);
+            for i in 0..decel {
+                let d = if decel > 1 {
+                    FAST_DELAY.saturating_add((span * i) / (decel - 1))
+                } else {
+                    SLOW_DELAY
+                };
+                pulse(d);
+            }
+        }
+
+        let _ = log::spawn(done_label);
+        spawn_next();
     }
 }
