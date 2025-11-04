@@ -50,7 +50,7 @@ mod app {
         sleep_pin: PA6<Output<PushPull>>, // DRV8825 SLEEP (HIGH = awake, LOW = sleep)
         cfg: Config,
         button_event: bool,
-        last_button_ms: u32,
+        in_motion: bool,
     }
 
     // Resources local to specific tasks (not shared)
@@ -152,7 +152,7 @@ mod app {
                 sleep_pin,
                 cfg,
                 button_event: false,
-                last_button_ms: 0,
+                in_motion: false,
             },
             Local { button_pin, fault_pin },
         )
@@ -178,21 +178,16 @@ mod app {
         });
     }
 
-    #[task(binds = EXTI9_5, local = [button_pin], shared = [button_event, last_button_ms])]
+    // this should also be deactivated during motion.
+    #[task(binds = EXTI9_5, local = [button_pin], shared = [button_event, in_motion])]
     fn exti_irq(ctx: exti_irq::Context) {
         // Clear the line's pending flag first
         ctx.local.button_pin.clear_interrupt_pending_bit();
 
-        // Simple debounce: only accept one event per 50 ms window
-        let now_ms: u32 = Mono::now().ticks(); // 1 kHz monotonic → ticks are milliseconds?
-        let mut accept = false;
-        (ctx.shared.last_button_ms, ctx.shared.button_event).lock(|last_ms, evt| {
-            let dt = now_ms.wrapping_sub(*last_ms);
-            if dt >= 500 {
-                // 500ms? debounce
-                *last_ms = now_ms;
+        // If we're currently moving, ignore button events
+        (ctx.shared.in_motion, ctx.shared.button_event).lock(|moving, evt| {
+            if !*moving {
                 *evt = true;
-                accept = true;
             }
         });
     }
@@ -281,9 +276,10 @@ mod app {
     // Open by stepping `travel_step_count` steps with a trapezoidal profile:
     // 10% accel (slow -> fast), 80% cruise (fast), 10% decel (fast -> slow).
     // Uses busy-wait delays (asm::delay cycles) for simplicity.
-    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, usb_dev, serial])]
+    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, in_motion, usb_dev, serial])]
     async fn opening(mut ctx: opening::Context) {
         let total_steps: u32 = ctx.shared.cfg.lock(|c| c.travel_step_count as u32);
+        ctx.shared.in_motion.lock(|m| *m = true);
 
         move_trapezoid(
             || { ctx.shared.dir_pin.lock(|dir| { dir.set_high(); }); },
@@ -301,13 +297,15 @@ mod app {
             b"-> opening\r\n",
             b"-> opened\r\n",
         ).await;
+        ctx.shared.in_motion.lock(|m| *m = false);
     }
 
     // Close by stepping `travel_step_count` steps with the same trapezoidal profile as `opening`,
     // but with direction LOW, then transition to `wait_closed`.
-    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, usb_dev, serial])]
+    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, in_motion, usb_dev, serial])]
     async fn closing(mut ctx: closing::Context) {
         let total_steps: u32 = ctx.shared.cfg.lock(|c| c.travel_step_count as u32);
+        ctx.shared.in_motion.lock(|m| *m = true);
 
         move_trapezoid(
             || { ctx.shared.dir_pin.lock(|dir| { dir.set_low(); }); },
@@ -325,6 +323,7 @@ mod app {
             b"-> closing\r\n",
             b"-> closed\r\n",
         ).await;
+        ctx.shared.in_motion.lock(|m| *m = false);
     }
 
     #[task(shared = [button_event, usb_dev, serial])]
