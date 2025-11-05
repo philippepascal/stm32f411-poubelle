@@ -3,7 +3,7 @@
 
 use hal::{
     gpio::{
-        Edge, ExtiPin, Input, Output, PushPull, gpioa::PA0, gpioa::PA1, gpioa::PA6, gpioa::PA7, gpioa::PA15, gpioc::PC13,
+        Edge, ExtiPin, Input, Output, PushPull, gpioa::PA0, gpioa::PA1, gpioa::PA2, gpioa::PA3, gpioa::PA6, gpioa::PA7, gpioa::PA15, gpioc::PC13,
     },
     otg_fs, pac,
     prelude::*,
@@ -51,6 +51,11 @@ mod app {
         cfg: Config,
         button_event: bool,
         in_motion: bool,
+        fully_closed: bool,
+        fully_open: bool,
+        manual_opening: bool,
+        manual_closing: bool,
+        opening_direction: bool, // true: HIGH is open, false: LOW is open
     }
 
     // Resources local to specific tasks (not shared)
@@ -58,6 +63,8 @@ mod app {
     struct Local {
         button_pin: PA7<Input>,
         fault_pin: PA15<Input>,
+        switch_closed: PA2<Input>,
+        switch_open: PA3<Input>,
     }
 
     #[init(local = [
@@ -87,6 +94,10 @@ mod app {
 
         // DRV8825 FAULT (active-low) on PA15
         let mut fault_pin = gpioa.pa15.into_pull_up_input();
+
+        // Position switches
+        let mut switch_closed = gpioa.pa2.into_pull_up_input(); // PA2: closed-limit / manual opening
+        let mut switch_open = gpioa.pa3.into_pull_up_input();   // PA3: open-limit / manual closing
 
         let mut sleep_pin = gpioa.pa6.into_push_pull_output();
         // Default driver to sleep until we intentionally wake for motion
@@ -136,6 +147,15 @@ mod app {
         fault_pin.trigger_on_edge(&mut exti, Edge::Falling);
         fault_pin.enable_interrupt(&mut exti);
 
+        // Configure EXTI on PA2 and PA3 (separate vectors EXTI2 and EXTI3)
+        switch_closed.make_interrupt_source(&mut syscfg);
+        switch_closed.trigger_on_edge(&mut exti, Edge::RisingFalling);
+        switch_closed.enable_interrupt(&mut exti);
+
+        switch_open.make_interrupt_source(&mut syscfg);
+        switch_open.trigger_on_edge(&mut exti, Edge::RisingFalling);
+        switch_open.enable_interrupt(&mut exti);
+
         // Later: store flash_writer in Shared so you can call save_config_blocking()
 
         // Kick off the state machine
@@ -153,8 +173,13 @@ mod app {
                 cfg,
                 button_event: false,
                 in_motion: false,
+                fully_closed: false,
+                fully_open: false,
+                manual_opening: false,
+                manual_closing: false,
+                opening_direction: false, // default
             },
-            Local { button_pin, fault_pin },
+            Local { button_pin, fault_pin, switch_closed, switch_open },
         )
     }
 
@@ -178,7 +203,7 @@ mod app {
         });
     }
 
-    // this should also be deactivated during motion.
+    // button trigger, replace with motion detector later
     #[task(binds = EXTI9_5, local = [button_pin], shared = [button_event, in_motion])]
     fn exti_irq(ctx: exti_irq::Context) {
         // Clear the line's pending flag first
@@ -192,6 +217,42 @@ mod app {
         });
     }
 
+    // EXTI2: PA2 (closed-limit / manual opening)
+    #[task(binds = EXTI2, local = [switch_closed], shared = [in_motion,fully_closed, manual_opening])]
+    fn exti_pa2(mut ctx: exti_pa2::Context) {
+        // Clear pending first
+        ctx.local.switch_closed.clear_interrupt_pending_bit();
+        // If pin is high → fully closed; if low → not fully closed and/or manual opening
+        let level_high = ctx.local.switch_closed.is_low();// inverted logic: LOW = switch closed
+        if level_high {
+            ctx.shared.fully_closed.lock(|f| *f = true);
+        } else {
+            ctx.shared.fully_closed.lock(|f| *f = false);
+            (ctx.shared.in_motion, ctx.shared.manual_opening).lock(|im, mo| {
+                *mo = !*im;
+            });
+            // ctx.shared.manual_opening.lock(|f| *f = true);
+        }
+    }
+
+    // EXTI3: PA3 (open-limit / manual closing)
+    #[task(binds = EXTI3, local = [switch_open], shared = [in_motion,fully_open, manual_closing])]
+    fn exti_pa3(mut ctx: exti_pa3::Context) {
+        // Clear pending first
+        ctx.local.switch_open.clear_interrupt_pending_bit();
+        // If pin is high → fully open; if low → not fully open and/or manual closing
+        let level_high = ctx.local.switch_open.is_low();// inverted logic: LOW = switch closed
+        if level_high {
+            ctx.shared.fully_open.lock(|f| *f = true);
+        } else {
+            ctx.shared.fully_open.lock(|f| *f = false);
+            (ctx.shared.in_motion, ctx.shared.manual_closing).lock(|im, mc| {
+                *mc = !*im;
+            });
+            // ctx.shared.manual_closing.lock(|f| *f = true);
+        }
+    }
+    
     // FAULT handler: log the event for now. 
     // Later: disable driver outputs, stop motion, etc.
     // Note: EXTI lines 10..15 share the same interrupt vector.
@@ -263,26 +324,126 @@ mod app {
         }
     }
 
-    // Fake calibrate: set travel_step_count in RAM only (no flash write), then wait for closed
-    #[task(shared = [cfg])]
+    // Calibrate: probe both directions and measure travel
+    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, fully_closed, fully_open, manual_opening, manual_closing, opening_direction])]
     async fn calibrate(mut ctx: calibrate::Context) {
-        let _ = log::spawn(b"-> calibrating\r\n");
-        ctx.shared.cfg.lock(|c| {
-            c.travel_step_count = 2000;
-        });
-        let _ = wait_closed::spawn();
+        // 2.1 wait 30 seconds to allow users to clear the area
+        let _ = log::spawn(b"-> calibrating: waiting 30s\r\n");
+        Mono::delay(30_u32.secs()).await;
+
+        // Clear flags before we start
+        // ctx.shared.fully_closed.lock(|f| *f = false);
+        // ctx.shared.fully_open.lock(|f| *f = false);
+        // ctx.shared.manual_opening.lock(|f| *f = false);
+        // ctx.shared.manual_closing.lock(|f| *f = false);
+
+        // Wake driver for calibration moves
+        ctx.shared.sleep_pin.lock(|s| { let _ = s.set_high(); });
+
+        // 2.2 set the direction on the controller to HIGH
+        ctx.shared.dir_pin.lock(|dir| { dir.set_high(); });
+
+        // Helper: perform one slow step (very conservative timing)
+        let slow_step = |step_pin: &mut PA1<Output<PushPull>>| {
+            step_pin.set_high();
+            asm::delay(150_000); // ~75us (depends on sysclk); adjust as needed
+            step_pin.set_low();
+            asm::delay(150_000);
+        };
+
+        // 2.3 move slowly until either fully_closed or fully_open is set
+        let _ = log::spawn(b"-> calibrating: probing HIGH direction\r\n");
+        // `high_is_open` = true if DIR=HIGH leads to fully_open, false if it leads to fully_closed
+        let high_is_open: bool = 'probe_high: loop {
+            // Check flags
+            let fc = ctx.shared.fully_closed.lock(|p| *p);
+            let fo = ctx.shared.fully_open.lock(|p| *p);
+            if fc { break 'probe_high false; }
+            if fo { break 'probe_high true; }
+
+            // Step once
+            ctx.shared.step_pin.lock(|step| slow_step(step));
+        };
+
+        // 2.4 decide opening_direction based on result of HIGH probe
+        if high_is_open {
+            // HIGH moved us to fully_open ⇒ opening is HIGH
+            ctx.shared.opening_direction.lock(|d| *d = true);
+            let _ = log::spawn(b"-> calibrating: opening_direction = HIGH\r\n");
+        } else {
+            // HIGH moved us to fully_closed ⇒ opening is LOW
+            ctx.shared.opening_direction.lock(|d| *d = false);
+            let _ = log::spawn(b"-> calibrating: opening_direction = LOW\r\n");
+        }
+
+        // 2.5 set direction to LOW and move slowly while counting steps until either end-stop is hit
+        ctx.shared.dir_pin.lock(|dir| { dir.set_low(); });
+
+        Mono::delay(1_u32.secs()).await;
+        // // Clear flags again before counting travel
+        // ctx.shared.fully_closed.lock(|f| *f = false);
+        // ctx.shared.fully_open.lock(|f| *f = false);
+
+        let _ = log::spawn(b"-> calibrating: measuring travel (LOW)\r\n");
+        let mut steps: u32 = 0;
+        'measure: loop {
+            // Check end stops
+            if high_is_open && ctx.shared.fully_closed.lock(|p| *p) {
+                // HIGH is open, LOW is closed, and we're fully closed
+                break 'measure;
+            }
+            if !high_is_open && ctx.shared.fully_open.lock(|p| *p) {
+                // HIGH is closed, LOW is open, and we're fully open
+                break 'measure;
+            }
+
+            // step and count
+            ctx.shared.step_pin.lock(|step| slow_step(step));
+            steps = steps.saturating_add(1);
+
+            // Optionally: put a hard cap to avoid endless loops if switches are miswired
+            if steps > 2_000_000 { let _ = log::spawn(b"-> calibrating: aborting, no end-stop\r\n"); break 'measure; }
+        }
+
+        Mono::delay(1_u32.secs()).await;
+        // save cfg.travel_step_count
+        ctx.shared.cfg.lock(|c| { c.travel_step_count = steps as u32; });
+        let _ = log::spawn(b"-> calibrating: travel_step_count set\r\n");
+        Mono::delay(1_u32.secs()).await;
+
+        // 2.6 transition based on current end-stop
+        let fc2 = ctx.shared.fully_closed.lock(|p| *p);
+        let fo2 = ctx.shared.fully_open.lock(|p| *p);
+        let (fc2, fo2) = (fc2, fo2);
+
+        // Put driver back to sleep after calibration moves
+        ctx.shared.sleep_pin.lock(|s| { let _ = s.set_low(); });
+
+        if fo2 {
+            let _ = closing::spawn();
+        } else if fc2 {
+            let _ = wait_closed::spawn();
+        } else {
+            // If neither asserted, default to wait_closed (safe)
+            let _ = wait_closed::spawn();
+        }
     }
 
     // Open by stepping `travel_step_count` steps with a trapezoidal profile:
     // 10% accel (slow -> fast), 80% cruise (fast), 10% decel (fast -> slow).
     // Uses busy-wait delays (asm::delay cycles) for simplicity.
-    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, in_motion, usb_dev, serial])]
+    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, in_motion, usb_dev, serial, opening_direction])]
     async fn opening(mut ctx: opening::Context) {
         let total_steps: u32 = ctx.shared.cfg.lock(|c| c.travel_step_count as u32);
         ctx.shared.in_motion.lock(|m| *m = true);
 
         move_trapezoid(
-            || { ctx.shared.dir_pin.lock(|dir| { dir.set_high(); }); },
+            || {
+                ctx.shared.dir_pin.lock(|dir| {
+                    let is_opening_high = ctx.shared.opening_direction.lock(|d| *d);
+                    if is_opening_high { dir.set_high(); } else { dir.set_low(); }
+                });
+            },
             |delay| {
                 ctx.shared.step_pin.lock(|step| {
                     step.set_high();
@@ -302,13 +463,18 @@ mod app {
 
     // Close by stepping `travel_step_count` steps with the same trapezoidal profile as `opening`,
     // but with direction LOW, then transition to `wait_closed`.
-    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, in_motion, usb_dev, serial])]
+    #[task(shared = [cfg, dir_pin, step_pin, sleep_pin, in_motion, usb_dev, serial, opening_direction])]
     async fn closing(mut ctx: closing::Context) {
         let total_steps: u32 = ctx.shared.cfg.lock(|c| c.travel_step_count as u32);
         ctx.shared.in_motion.lock(|m| *m = true);
 
         move_trapezoid(
-            || { ctx.shared.dir_pin.lock(|dir| { dir.set_low(); }); },
+            || {
+                ctx.shared.dir_pin.lock(|dir| {
+                    let is_opening_high = ctx.shared.opening_direction.lock(|d| *d);
+                    if is_opening_high { dir.set_low(); } else { dir.set_high(); }
+                });
+            },
             |delay| {
                 ctx.shared.step_pin.lock(|step| {
                     step.set_high();
