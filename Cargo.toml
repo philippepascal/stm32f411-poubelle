@@ -14,13 +14,17 @@ cortex-m-rt = "0.7"
 
 # Your existing HAL & PAC; make sure the stm32f411 feature is on
 stm32f4xx-hal = { version = "0.22.1", features = ["stm32f411", "usb_fs"] }
+# stm32f4xx-hal = { version = "0.22.1", features = ["rt", "usb_fs", "i2c"] }
 alloc-cortex-m = "0.4"
+# embedded-hal = "0.2"
+embedded-hal = { version = "0.2.7", features = ["unproven"] }
 # Peripheral Access Crate (auto-generated low-level regs for F411)
 stm32f4 = { version = "0.16", features = ["stm32f411", "rt"] }
 # High-level Hardware Abstraction Layer for stm32f4xx
 panic-halt = "0.2"
 usb-device = "0.3"
 usbd-serial = "0.2.2"
+vl53l1x-uld = "1.0.0"       # uses embedded-hal
 #flash stuff
 serde = { version = "1", default-features = false, features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-crc"] } # pure no_std
