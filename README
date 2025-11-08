@@ -58,3 +58,42 @@ PA10–PA14   10–14   EXTI15_10   Shares vector with PA15
 
 So for two more distinct interrupts, the simplest and least-conflicting choices are PA2 and PA3.
 ----------------------------------------------------------------
+
+STM32 Pin			Connects To		Purpose
+3.3V				VL53L1X VCC		Power
+GND					VL53L1X GND		Ground
+PB8					VL53L1X SCL		I²C Clock
+PB9					VL53L1X SDA		I²C Data
+PB0					Sensor 1 XSHUT	Reset / Address assignment
+PB1					Sensor 2 XSHUT	Reset / Address assignment
+PB5					Sensor 1 GPIO1	Interrupt output to detect motion, share EXTI9_5 with PA7 (button)
+PB6					Sensor 2 GPIO1	Interrupt output to detect motion, share EXTI9_5 with PA7 (button)
+
+PB8/PB9 are I2C1 on STM32F411.
+
+By default, both sensors power up with the same I²C address (0x29).
+
+To use them simultaneously on the same I²C bus:
+	1.	Connect both to the same SDA/SCL/I2C bus.
+	2.	Tie each XSHUT pin to a different GPIO (e.g., PA4 and PA5).
+	3.	At startup:
+	•	Drive both XSHUT pins LOW (reset state).
+	•	Bring sensor 1 XSHUT HIGH, initialize it, change its I²C address.
+	•	Bring sensor 2 XSHUT HIGH, initialize it, assign a different I²C address.
+
+This way both coexist on one I2C bus.
+
+ Important Electrical Notes
+	•	Pull-up resistors (2.2k–4.7k) on SDA/SCL required — most breakout boards include them.
+	•	Logic is 3.3V compatible (VL53L1X is 3.3V native).
+	•	XSHUT pin is active LOW — pull LOW to reset/disable sensor.
+
+⸻
+
+✅ What You’ll Get Next in Code (When Ready)
+	•	I²C initialization via stm32f4xx-hal.
+	•	Sensor startup sequence + address reassignment.
+	•	Non-blocking ranging in its own RTIC task.
+	•	Instead of button event → trigger manual_opening.
+
+----------------------------------------------------------------
