@@ -391,10 +391,70 @@ mod app {
         }
     }
 
-    #[task]
-    async fn sensor2_motion(_ctx: sensor2_motion::Context) { 
-        // let _ = log::spawn(b"-> VL53 S2 motion\r\n"); 
-        Mono::delay(1_u32.millis()).await;
+    #[task(shared = [s2_state, s2_enter_time, in_motion, button_event, usb_dev, serial])]
+    async fn sensor2_motion(mut ctx: sensor2_motion::Context) {
+        // Classify the edge by sampling the line level now (PB6)
+        let level_high = unsafe { (*pac::GPIOB::ptr()).idr().read().idr6().bit_is_set() };
+        let now = Mono::now();
+
+        if level_high {
+            // ENTER event
+            let _ = log::spawn(b"S2:ENTER_EDGE\r\n");
+            Mono::delay(1_u32.millis()).await;
+
+            // Start tracking only from Idle
+            ctx.shared.s2_state.lock(|st| {
+                if *st == FootState::Idle {
+                    *st = FootState::Inside;
+                }
+            });
+            ctx.shared.s2_enter_time.lock(|t| *t = Some(now));
+
+        } else {
+            // EXIT event
+            let (state, t0_opt) = (
+                ctx.shared.s2_state.lock(|s| *s),
+                ctx.shared.s2_enter_time.lock(|t| *t),
+            );
+
+            if state == FootState::Inside {
+                if let Some(t0) = t0_opt {
+                    let dt_ms = (now - t0).to_millis();
+                    if dt_ms >= WINDOW_MIN_MS && dt_ms <= WINDOW_MAX_MS {
+                        // Valid transient!
+                        let _ = log::spawn(b"FOOT: S2 TRANSIENT\r\n");
+                        Mono::delay(1_u32.millis()).await;
+
+                        // Trigger your action if not already moving
+                        let should_trigger = ctx.shared.in_motion.lock(|m| !*m);
+                        if should_trigger {
+                            ctx.shared.button_event.lock(|evt| *evt = true);
+                        }
+
+                        // Cooldown
+                        ctx.shared.s2_state.lock(|s| *s = FootState::Cooldown);
+                        ctx.shared.s2_enter_time.lock(|t| *t = None);
+                        let _ = s2_cooldown_alarm::spawn();
+                    } else {
+                        // Too short or too long
+                        let msg = if dt_ms < WINDOW_MIN_MS { b"S2:EXIT_SHORT\r\n" } else { b"S2:EXIT_LONG \r\n" };
+                        let _ = log::spawn(msg);
+                        Mono::delay(1_u32.millis()).await;
+                        ctx.shared.s2_state.lock(|s| *s = FootState::Idle);
+                        ctx.shared.s2_enter_time.lock(|t| *t = None);
+                    }
+                } else {
+                    // No timestamp — reset
+                    ctx.shared.s2_state.lock(|s| *s = FootState::Idle);
+                }
+            } else if state == FootState::IgnoredLongPresence {
+                // Leaving after we had marked a long presence: just reset to Idle
+                let _ = log::spawn(b"S2:EXIT_AFTER_LONG\r\n");
+                Mono::delay(1_u32.millis()).await;
+                ctx.shared.s2_state.lock(|s| *s = FootState::Idle);
+                ctx.shared.s2_enter_time.lock(|t| *t = None);
+            }
+        }
     }
 
     // EXTI2: PA2 (closed-limit / manual opening)
@@ -668,7 +728,7 @@ mod app {
                     let _ = s2.set_timing_budget_ms(i2c,50);
                     let _ = s2.set_inter_measurement_period_ms(i2c,100);
                     let _ = s2.set_distance_threshold(i2c, Threshold::new(0, ENTER_MM, Window::In));
-                    let _ = s2.set_interrupt_polarity(i2c, Polarity::ActiveLow);
+                    let _ = s2.set_interrupt_polarity(i2c, Polarity::ActiveHigh);
                     let _ = s2.start_ranging(i2c);
                     s2_ok = true;
             }
@@ -681,6 +741,7 @@ mod app {
         
         // TODO: configure both sensors for continuous ranging + GPIO1 interrupt behavior
         let _ = log::spawn(b"-> VL53 init done\r\n");
+        Mono::delay(1_u32.millis()).await;
         // Start distance ranging + periodic GPIO/I2C checks
         let _ = vl53_range_loop::spawn();
         Mono::delay(1_u32.millis()).await;
@@ -1153,7 +1214,8 @@ mod app {
     //   SYSTEM__INTERRUPT_CLEAR (0x0086)        -> write 0x01 after reading to clear "data ready"
     //   RESULT__FINAL_CROSSTALK_CORRECTED_RANGE_MM_SD0 (0x0096) -> 16-bit distance in mm
     //   RESULT__RANGE_STATUS (0x0089)           -> optional status
-    #[task(shared = [i2c1, sensor1_present, sensor2_present, serial, s1_ranging, s2_ranging, s1_state, s1_enter_time, in_motion, button_event])]
+    #[task(shared = [i2c1, sensor1_present, sensor2_present, serial, s1_ranging, s2_ranging, s1_state, 
+                    s1_enter_time, s2_state, s2_enter_time, in_motion, button_event])]
     async fn vl53_range_loop(mut ctx: vl53_range_loop::Context) {
         // track whether we've started continuous ranging per sensor
         let mut s1_started = false;
@@ -1290,6 +1352,50 @@ mod app {
                         Mono::delay(1_u32.millis()).await;
                     }
                     s2_gate = s2_gate.wrapping_add(1) % 5;
+
+                    // --- S2 exit logic ---
+                    let now = Mono::now();
+                    let (state, entered_at) = (
+                        ctx.shared.s2_state.lock(|s| *s),
+                        ctx.shared.s2_enter_time.lock(|t| *t),
+                    );
+
+                    match state {
+                        FootState::Inside => {
+                            if dist >= ENTER_MM {
+                                if let Some(t0) = entered_at {
+                                    let dt_ms = (now - t0).to_millis();
+                                    if dt_ms >= WINDOW_MIN_MS && dt_ms <= WINDOW_MAX_MS {
+                                        let _ = log::spawn(b"FOOT: S2 TRANSIENT\r\n");
+                                        Mono::delay(1_u32.millis()).await;
+                                        let should_trigger = ctx.shared.in_motion.lock(|moving| !*moving);
+                                        if should_trigger {
+                                            ctx.shared.button_event.lock(|evt| *evt = true);
+                                        }
+                                        ctx.shared.s2_state.lock(|s| *s = FootState::Cooldown);
+                                        let _ = s2_cooldown_alarm::spawn();
+                                    } else {
+                                        if dt_ms < WINDOW_MIN_MS { let _ = log::spawn(b"S2:EXIT_SHORT\r\n"); }
+                                        else { let _ = log::spawn(b"S2:EXIT_LONG\r\n"); }
+                                        Mono::delay(1_u32.millis()).await;
+                                        ctx.shared.s2_state.lock(|s| *s = FootState::Idle);
+                                        ctx.shared.s2_enter_time.lock(|t| *t = None);
+                                    }
+                                } else {
+                                    ctx.shared.s2_state.lock(|s| *s = FootState::Idle);
+                                }
+                            }
+                        }
+                        FootState::IgnoredLongPresence => {
+                            if dist >= ENTER_MM {
+                                let _ = log::spawn(b"S2:EXIT_AFTER_LONG\r\n");
+                                Mono::delay(1_u32.millis()).await;
+                                ctx.shared.s2_state.lock(|s| *s = FootState::Idle);
+                                ctx.shared.s2_enter_time.lock(|t| *t = None);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -1308,6 +1414,20 @@ mod app {
         ctx.shared.s1_state.lock(|s| *s = FootState::Idle);
         ctx.shared.s1_enter_time.lock(|t| *t = None);
         let _ = log::spawn(b"S1:COOLDOWN_DONE\r\n");
+        Mono::delay(1_u32.millis()).await;
+    }
+
+    #[task]
+    async fn s2_cooldown_alarm(_ctx: s2_cooldown_alarm::Context) {
+        Mono::delay(COOLDOWN_MS.millis()).await;
+        let _ = s2_cooldown_done::spawn();
+    }
+
+    #[task(shared = [s2_state, s2_enter_time])]
+    async fn s2_cooldown_done(mut ctx: s2_cooldown_done::Context) {
+        ctx.shared.s2_state.lock(|s| *s = FootState::Idle);
+        ctx.shared.s2_enter_time.lock(|t| *t = None);
+        let _ = log::spawn(b"S2:COOLDOWN_DONE\r\n");
         Mono::delay(1_u32.millis()).await;
     }
 }
