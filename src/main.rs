@@ -106,8 +106,8 @@ mod app {
         // VL53L1X control/interrupt pins
         xshut1: PB0<Output<PushPull>>, // Sensor 1 XSHUT
         xshut2: PB1<Output<PushPull>>, // Sensor 2 XSHUT
-        int1: PB5<Input>,              // Sensor 1 GPIO1
-        int2: PB6<Input>,              // Sensor 2 GPIO1
+        sensor1: PB5<Input>,              // Sensor 1 GPIO1
+        sensor2: PB6<Input>,              // Sensor 2 GPIO1
     }
 
     #[init(local = [
@@ -159,8 +159,8 @@ mod app {
         let _ = xshut2.set_low();
 
         // VL53L1X GPIO1 interrupt pins
-        let mut int1 = gpiob.pb5.into_pull_up_input();
-        let mut int2 = gpiob.pb6.into_pull_up_input();
+        let mut sensor1 = gpiob.pb5.into_pull_up_input();
+        let mut sensor2 = gpiob.pb6.into_pull_up_input();
 
         unsafe { cortex_m::peripheral::NVIC::unmask(pac::Interrupt::EXTI9_5); }
 
@@ -218,19 +218,20 @@ mod app {
         open_position_switch.enable_interrupt(&mut exti);
 
         // Route PB5/PB6 to EXTI and enable interrupts (EXTI9_5 vector)
-        int1.make_interrupt_source(&mut syscfg);
-        int1.trigger_on_edge(&mut exti, Edge::Rising);
-        int1.enable_interrupt(&mut exti);
+        sensor1.make_interrupt_source(&mut syscfg);
+        sensor1.trigger_on_edge(&mut exti, Edge::RisingFalling);
+        sensor1.enable_interrupt(&mut exti);
 
-        int2.make_interrupt_source(&mut syscfg);
-        int2.trigger_on_edge(&mut exti, Edge::Rising);
-        int2.enable_interrupt(&mut exti);
+        sensor2.make_interrupt_source(&mut syscfg);
+        sensor2.trigger_on_edge(&mut exti, Edge::RisingFalling);
+        sensor2.enable_interrupt(&mut exti);
 
         // Later: store flash_writer in Shared so you can call save_config_blocking()
 
         // Kick off the state machine
         let _ = heartbeat::spawn();
-        let _ = start_door::spawn();
+        let _ = vl53_init::spawn();
+        // let _ = start_door::spawn();
 
         (
             Shared {
@@ -271,8 +272,8 @@ mod app {
                 open_position_switch,
                 xshut1,
                 xshut2,
-                int1,
-                int2,
+                sensor1,
+                sensor2,
             },
         )
     }
@@ -298,7 +299,7 @@ mod app {
     }
 
     // PB5 / PB6 (VL53L1X GPIO1) and PA7 (button) share EXTI9_5
-    #[task(binds = EXTI9_5, local = [button_pin, int1, int2], shared = [button_event, in_motion])]
+    #[task(binds = EXTI9_5, local = [button_pin, sensor1, sensor2], shared = [button_event, in_motion])]
     fn exti_irq(ctx: exti_irq::Context) {
         // PB5 / PB6 (VL53L1X GPIO1) and PA7 (button) share EXTI9_5
         // Clear pending on any that fired, and react accordingly.
@@ -312,112 +313,83 @@ mod app {
         }
 
         // Sensor 1 on PB5
-        if ctx.local.int1.check_interrupt() {
-            ctx.local.int1.clear_interrupt_pending_bit();
+        if ctx.local.sensor1.check_interrupt() {
+            ctx.local.sensor1.clear_interrupt_pending_bit();
             let _ = sensor1_motion::spawn();
         }
 
         // Sensor 2 on PB6
-        if ctx.local.int2.check_interrupt() {
-            ctx.local.int2.clear_interrupt_pending_bit();
+        if ctx.local.sensor2.check_interrupt() {
+            ctx.local.sensor2.clear_interrupt_pending_bit();
             let _ = sensor2_motion::spawn();
         }
     }
 
-    #[task(shared = [i2c1, s1_state, s1_enter_time, usb_dev, serial])]
+    #[task(shared = [s1_state, s1_enter_time, in_motion, button_event, usb_dev, serial])]
     async fn sensor1_motion(mut ctx: sensor1_motion::Context) {
-        // Read one sample & clear IRQ
-        let (rs, d) = ctx.shared.i2c1.lock(|i2c| {
-            let s = VL53L1X::new(0x2A);
-            let rs = s.get_range_status(i2c).unwrap_or(RangeStatus::None);
-            let d  = s.get_distance(i2c).unwrap_or(u16::MAX);
-            let _  = s.clear_interrupt(i2c);
-            (rs, d)
-        });
-        ctx.shared.serial.lock(|serial| {
-            let _ = serial.write(b"S1:In State MAchine Reading: ");
-            print_u8(serial, "RS", rs as u8);
-            print_u16(serial, "D", d);
-            let _ = serial.write(b"\r\n");
-        });
-        Mono::delay(1_u32.millis()).await;
-
-        // Ignore invalid measurements
-        if rs as u8 != 0 {  let _ = log::spawn(b"S1:READ FAILED\r\n"); Mono::delay(1.millis()).await; return;}
-
+        // Classify the edge by sampling the line level now
+        let level_high = unsafe { (*pac::GPIOB::ptr()).idr().read().idr5().bit_is_set() };
         let now = Mono::now();
 
-        // State transition
-        let mut to_start_timeout = false;
-
-        let _ = log::spawn(b"S1:starting state machine\r\n");
-        Mono::delay(1.millis()).await;
-
-        let foot_state = ctx.shared.s1_state.lock(|st| { *st});
-        match foot_state {
-            FootState::Idle => {
-                let _ = log::spawn(b"S1:Idle!\r\n");
-                Mono::delay(1.millis()).await;
-                if d < ENTER_MM {
-                    let _ = log::spawn(b"S1:changing to Inside\r\n");
-                    Mono::delay(1.millis()).await;
-                    ctx.shared.s1_state.lock(|st| {
-                        *st = FootState::Inside;
-                    });
-                    // record entry time
-                    ctx.shared.s1_enter_time.lock(|t| *t = Some(now));
-                    to_start_timeout = true; // arm WINDOW_MAX timer
-                }
-            }
-            FootState::Inside => {
-                let _ = log::spawn(b"S1:already inside\r\n");
-                Mono::delay(1.millis()).await;
-                // we only get GPIO1 on enter; we also need to detect exit:
-                // poll distance once more here: if already outside, treat as exit
-                // (Alternatively, rely on your periodic range loop to call a small “exit check” task.)
-            }
-            FootState::IgnoredLongPresence | FootState::Cooldown => {
-                let _ = log::spawn(b"S1:Ignored long presence\r\n");
-                Mono::delay(1.millis()).await;
-                // Do nothing on extra enters while suppressed
-            }
-        }
-        if to_start_timeout {
-            // We no longer have `spawn_after` (removed with rtic-monotonics). Arm a small
-            // async timer task that sleeps, then spawns the timeout handler.
-            let _ = s1_inside_timeout_alarm::spawn();
-        }
-    }
-
-    // Small helper task: wait WINDOW_MAX, then trigger inside-timeout evaluation.
-    #[task]
-    async fn s1_inside_timeout_alarm(_ctx: s1_inside_timeout_alarm::Context) {
-        let _ = log::spawn(b"S1:ENTER\r\n");
-        Mono::delay(WINDOW_MAX_MS.millis()).await;
-        let _ = s1_inside_timeout::spawn();
-    }
-
-    // Fired WINDOW_MAX after entering; decides whether we ignore long presence
-    #[task(shared = [i2c1, s1_state, s1_enter_time, usb_dev, serial])]
-    async fn s1_inside_timeout(mut ctx: s1_inside_timeout::Context) {
-        // Re-check distance (are we still inside?)
-        let (rs, d) = ctx.shared.i2c1.lock(|i2c| {
-            let s = VL53L1X::new(0x2A);
-            let rs = s.get_range_status(i2c).unwrap_or(RangeStatus::None);
-            let d  = s.get_distance(i2c).unwrap_or(u16::MAX);
-            (rs, d)
-        });
-
-        if rs as u8 != 0 { return; }
-
-        // If still inside after WINDOW_MAX → ignore until exit
-        if d < ENTER_MM {
-            ctx.shared.s1_state.lock(|st| *st = FootState::IgnoredLongPresence);
-            let _ = log::spawn(b"S1:LONG_PRESENCE\r\n");
+        if level_high {
+            // ENTER event: inside window
+            let _ = log::spawn(b"S1:ENTER_EDGE\r\n");
             Mono::delay(1_u32.millis()).await;
+
+            // Start tracking only from Idle
+            ctx.shared.s1_state.lock(|st| {
+                if *st == FootState::Idle {
+                    *st = FootState::Inside;
+                }
+            });
+            ctx.shared.s1_enter_time.lock(|t| *t = Some(now));
+
+        } else {
+            // EXIT event: left window — decide what to do based on dwell time
+            let (state, t0_opt) = (
+                ctx.shared.s1_state.lock(|s| *s),
+                ctx.shared.s1_enter_time.lock(|t| *t),
+            );
+
+            if state == FootState::Inside {
+                if let Some(t0) = t0_opt {
+                    let dt_ms = (now - t0).to_millis();
+                    if dt_ms >= WINDOW_MIN_MS && dt_ms <= WINDOW_MAX_MS {
+                        // Valid transient!
+                        let _ = log::spawn(b"FOOT: S1 TRANSIENT\r\n");
+                        Mono::delay(1_u32.millis()).await;
+
+                        // Trigger your action if not already moving
+                        let should_trigger = ctx.shared.in_motion.lock(|m| !*m);
+                        if should_trigger {
+                            ctx.shared.button_event.lock(|evt| *evt = true);
+                        }
+
+                        // Cooldown
+                        ctx.shared.s1_state.lock(|s| *s = FootState::Cooldown);
+                        ctx.shared.s1_enter_time.lock(|t| *t = None);
+                        let _ = s1_cooldown_alarm::spawn();
+                    } else {
+                        // Too short or too long
+                        let msg = if dt_ms < WINDOW_MIN_MS { b"S1:EXIT_SHORT\r\n" } else { b"S1:EXIT_LONG \r\n" };
+                        let _ = log::spawn(msg);
+                        Mono::delay(1_u32.millis()).await;
+                        ctx.shared.s1_state.lock(|s| *s = FootState::Idle);
+                        ctx.shared.s1_enter_time.lock(|t| *t = None);
+                    }
+                } else {
+                    // No timestamp — reset
+                    ctx.shared.s1_state.lock(|s| *s = FootState::Idle);
+                }
+            } else if state == FootState::IgnoredLongPresence {
+                // Leaving after we had marked a long presence: just reset to Idle
+                let _ = log::spawn(b"S1:EXIT_AFTER_LONG\r\n");
+                Mono::delay(1_u32.millis()).await;
+                ctx.shared.s1_state.lock(|s| *s = FootState::Idle);
+                ctx.shared.s1_enter_time.lock(|t| *t = None);
+            }
         }
     }
-
 
     #[task]
     async fn sensor2_motion(_ctx: sensor2_motion::Context) { 
@@ -567,7 +539,7 @@ mod app {
 
         let _ = log::spawn(b"-> starting\r\n");
         Mono::delay(1_u32.millis()).await;
-        let _ = vl53_init::spawn();
+        
         let mut steps = 0u32;
         ctx.shared.cfg.lock(|c| {
             steps = c.travel_step_count as u32;
@@ -696,7 +668,7 @@ mod app {
                     let _ = s2.set_timing_budget_ms(i2c,50);
                     let _ = s2.set_inter_measurement_period_ms(i2c,100);
                     let _ = s2.set_distance_threshold(i2c, Threshold::new(0, ENTER_MM, Window::In));
-                    let _ = s2.set_interrupt_polarity(i2c, Polarity::ActiveHigh);
+                    let _ = s2.set_interrupt_polarity(i2c, Polarity::ActiveLow);
                     let _ = s2.start_ranging(i2c);
                     s2_ok = true;
             }
@@ -714,6 +686,8 @@ mod app {
         Mono::delay(1_u32.millis()).await;
         // let _ = vl53_loopcheck::spawn();
         // Mono::delay(1_u32.millis()).await;
+
+        let _ = start_door::spawn();
     }
 
     // Calibrate: probe both directions and measure travel
