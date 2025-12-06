@@ -100,9 +100,9 @@ mod app {
     #[local]
     struct Local {
         button_pin: PA7<Input>,
-        fault_pin: PA15<Input>,
-        closed_position_switch: PA2<Input>,
-        open_position_switch: PA3<Input>,
+        motor_fault_pin: PA15<Input>,
+        closed_detector_pin: PA2<Input>,
+        open_detector_pin: PA3<Input>,
         // VL53L1X control/interrupt pins
         xshut1: PB0<Output<PushPull>>, // Sensor 1 XSHUT
         xshut2: PB1<Output<PushPull>>, // Sensor 2 XSHUT
@@ -137,11 +137,11 @@ mod app {
         let _ = led_pin.set_high();
 
         // DRV8825 FAULT (active-low) on PA15
-        let mut fault_pin = gpioa.pa15.into_pull_up_input();
+        let mut motor_fault_pin = gpioa.pa15.into_pull_up_input();
 
         // Position switches
-        let mut closed_position_switch = gpioa.pa2.into_pull_up_input(); // PA2: closed-limit / manual opening
-        let mut open_position_switch = gpioa.pa3.into_pull_up_input();   // PA3: open-limit / manual closing
+        let mut closed_detector_pin = gpioa.pa2.into_pull_up_input(); // PA2: closed-limit / manual opening
+        let mut open_detector_pin = gpioa.pa3.into_pull_up_input();   // PA3: open-limit / manual closing
 
         let mut sleep_pin = gpioa.pa6.into_push_pull_output();
         // Default driver to sleep until we intentionally wake for motion
@@ -204,18 +204,18 @@ mod app {
         button_pin.enable_interrupt(&mut exti);
 
         // Configure EXTI on PA15 for FAULT (lines 10..15 use EXTI15_10 interrupt)
-        fault_pin.make_interrupt_source(&mut syscfg);
-        fault_pin.trigger_on_edge(&mut exti, Edge::Falling);
-        fault_pin.enable_interrupt(&mut exti);
+        motor_fault_pin.make_interrupt_source(&mut syscfg);
+        motor_fault_pin.trigger_on_edge(&mut exti, Edge::Falling);
+        motor_fault_pin.enable_interrupt(&mut exti);
 
         // Configure EXTI on PA2 and PA3 (separate vectors EXTI2 and EXTI3)
-        closed_position_switch.make_interrupt_source(&mut syscfg);
-        closed_position_switch.trigger_on_edge(&mut exti, Edge::RisingFalling);
-        closed_position_switch.enable_interrupt(&mut exti);
+        closed_detector_pin.make_interrupt_source(&mut syscfg);
+        closed_detector_pin.trigger_on_edge(&mut exti, Edge::RisingFalling);
+        closed_detector_pin.enable_interrupt(&mut exti);
 
-        open_position_switch.make_interrupt_source(&mut syscfg);
-        open_position_switch.trigger_on_edge(&mut exti, Edge::RisingFalling);
-        open_position_switch.enable_interrupt(&mut exti);
+        open_detector_pin.make_interrupt_source(&mut syscfg);
+        open_detector_pin.trigger_on_edge(&mut exti, Edge::RisingFalling);
+        open_detector_pin.enable_interrupt(&mut exti);
 
         // Route PB5/PB6 to EXTI and enable interrupts (EXTI9_5 vector)
         sensor1.make_interrupt_source(&mut syscfg);
@@ -267,9 +267,9 @@ mod app {
             },
             Local {
                 button_pin,
-                fault_pin,
-                closed_position_switch,
-                open_position_switch,
+                motor_fault_pin,
+                closed_detector_pin,
+                open_detector_pin,
                 xshut1,
                 xshut2,
                 sensor1,
@@ -458,13 +458,13 @@ mod app {
     }
 
     // EXTI2: PA2 (closed-limit / manual opening)
-    #[task(binds = EXTI2, local = [closed_position_switch], shared = [fully_closed_switch_debouncing_flag, fully_closed_last_switch_state])]
+    #[task(binds = EXTI2, local = [closed_detector_pin], shared = [fully_closed_switch_debouncing_flag, fully_closed_last_switch_state])]
     fn exti_pa2(mut ctx: exti_pa2::Context) {
         // Clear pending first
-        ctx.local.closed_position_switch.clear_interrupt_pending_bit();
+        ctx.local.closed_detector_pin.clear_interrupt_pending_bit();
 
         ctx.shared.fully_closed_last_switch_state.lock(|p| {
-            *p = ctx.local.closed_position_switch.is_low(); // inverted logic: LOW = switch closed
+            *p = ctx.local.closed_detector_pin.is_low(); // inverted logic: LOW = switch closed
         });
 
         ctx.shared.fully_closed_switch_debouncing_flag.lock(|f| {
@@ -498,13 +498,13 @@ mod app {
     }
 
     // EXTI3: PA3 (open-limit / manual closing)
-    #[task(binds = EXTI3, local = [open_position_switch], shared = [fully_open_switch_debouncing_flag, fully_open_last_switch_state])]
+    #[task(binds = EXTI3, local = [open_detector_pin], shared = [fully_open_switch_debouncing_flag, fully_open_last_switch_state])]
     fn exti_pa3(mut ctx: exti_pa3::Context) {
         // Clear pending first
-        ctx.local.open_position_switch.clear_interrupt_pending_bit();
+        ctx.local.open_detector_pin.clear_interrupt_pending_bit();
 
         ctx.shared.fully_open_last_switch_state.lock(|p| {
-            *p = ctx.local.open_position_switch.is_low(); // inverted logic: LOW = switch closed
+            *p = ctx.local.open_detector_pin.is_low(); // inverted logic: LOW = switch closed
         });
 
         ctx.shared.fully_open_switch_debouncing_flag.lock(|f| {
@@ -544,10 +544,10 @@ mod app {
     // If multiple pins on those lines are used, you'll need to check
     // which one triggered the interrupt.
     // This doesn't seem to detect blockage... not sure it's worth doing much with it
-    #[task(binds = EXTI15_10, local = [fault_pin])]
+    #[task(binds = EXTI15_10, local = [motor_fault_pin])]
     fn exti_fault(ctx: exti_fault::Context) {
         // Clear pending first to avoid immediate retrigger
-        ctx.local.fault_pin.clear_interrupt_pending_bit();
+        ctx.local.motor_fault_pin.clear_interrupt_pending_bit();
         let _ = log::spawn(b"-> FAULT asserted\r\n");
     }
 

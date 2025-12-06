@@ -2,7 +2,9 @@
 curl https://sh.rustup.rs -sSf | sh
 
 # Add the Cortex-M bare-metal target
-rustup target add thumbv7em-none-eabi
+rustup target add thumbv7em-none-eabi // this might not be needed anymore, since we are doing the next line:
+//??? did we forget to document: rustup target add thumbv7em-none-eabihf
+
 #thumbv7em = Cortex-M4/M7 with floating point instructions available
 #none = no OS
 #eabi = ARM embedded ABI
