@@ -99,3 +99,9 @@ This way both coexist on one I2C bus.
 	•	Instead of button event → trigger manual_opening.
 
 ----------------------------------------------------------------
+
+Notes on next improvements:
+- Simpler Move (use a pwm)
+- more robust decounce
+- Switch only act as detectors not as state: they don't trigger movement
+- 
